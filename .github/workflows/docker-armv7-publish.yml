@@ -1,0 +1,141 @@
+# YYB-Go-Enhanced — armv7 (玩客云) Docker 镜像构建与发布
+#
+# 放到你自己的仓库 .github/workflows/docker-armv7-publish.yml 后：
+#   - 推送 main 或打 v* 标签自动构建，也可在 Actions 页面手动触发
+#   - 镜像发布到 ghcr.io/<你的用户名>/<仓库名小写>:armv7（自动跟随所在仓库）
+#   - 构建时自动把程序内的官方在线更新地址（版本检查 / update_url / 青龙脚本仓库）
+#     替换为你自己的仓库地址，镜像内的"检查更新"将指向你的库
+#
+# 首次发布后 ghcr 包默认私有：仓库 Packages 页 → 包设置 → Change visibility → Public，
+# 之后玩客云无需登录即可 docker pull。
+
+name: Build armv7 Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '额外镜像标签（可选，例如 v0.2.16）'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'Dockerfile.armv7'
+      - 'go.mod'
+      - 'go.sum'
+      - 'VERSION'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'resource/**'
+      - '.github/workflows/docker-armv7-publish.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-armv7-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ★ 核心步骤：把官方在线更新地址替换为当前仓库
+      #   - internal/httpapi/maintenance.go  版本检查（raw + api 两个 URL）
+      #   - internal/httpapi/version.go      /version 接口返回的 update_url
+      #   - internal/httpapi/app.go          青龙脚本同步仓库列表
+      - name: Patch update URLs to this repository
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          repo_u="${REPO//\//_}"
+          files=$(grep -rl "525815266" --include='*.go' . || true)
+          if [[ -z "$files" ]]; then
+            echo "::warning::未找到官方地址，上游可能已改动代码结构，请人工确认"
+            exit 0
+          fi
+          sed -i "s|525815266/YYB-Go-Enhanced|${REPO}|g; s|525815266_YYB-Go-Enhanced|${repo_u}|g" $files
+          echo "== 替换后核对 =="
+          grep -rn "maintenanceVersionURL\|maintenanceVersionAPIURL\|update_url\|QingLongRepo = " internal/httpapi/ || true
+          if grep -rq "525815266" --include='*.go' .; then
+            echo "::error::仍有官方地址残留"; grep -rn "525815266" --include='*.go' .; exit 1
+          fi
+          echo "update URLs -> ${REPO}"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -Eeuo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(tr -d '[:space:]' < VERSION)"
+          fi
+          {
+            echo "version=$version"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: tags
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -Eeuo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags=("$image:armv7" "$image:${VERSION}-armv7")
+          [[ -n "${INPUT_TAG:-}" ]] && tags+=("$image:${INPUT_TAG,,}")
+          [[ "$GITHUB_REF_TYPE" == "tag" ]] && tags+=("$image:latest")
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}" | awk '!seen[$0]++'
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.armv7
+          platforms: linux/arm/v7
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.ver.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 可选冒烟测试：在 QEMU 里跑一下刚发布的镜像，确认 armv7 二进制可执行（非阻断）
+      - name: Smoke test under qemu
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker pull --platform linux/arm/v7 "$image:armv7"
+          docker run --rm --platform linux/arm/v7 --entrypoint /app/yyb-go "$image:armv7" -h 2>&1 | head -8 \
+            || echo "::warning::qemu 冒烟测试未通过（不影响已推送的镜像，建议到设备上实测）"
