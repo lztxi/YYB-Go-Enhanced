@@ -1,0 +1,58 @@
+# YYB-Go-Enhanced — linux/arm/v7 (玩客云) 构建文件
+# 与上游 v0.2.16 官方 Dockerfile 等价，区别：显式 GOARM=7 + 运行层固定 arm/v7。
+#
+# 用法（任意装有 Docker + buildx 的机器）：
+#   docker run --privileged --rm tonistiigi/binfmt --install arm   # 仅 x86 机器需要 QEMU
+#   docker buildx build --platform linux/arm/v7 -f Dockerfile.armv7 -t yyb-go-enhanced:armv7 .
+# 在玩客云本机构建（本机即 armv7，无需 buildx/QEMU）：
+#   docker build -f Dockerfile.armv7 -t yyb-go-enhanced:armv7 .
+
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+
+ARG VERSION=0.2.16
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+ARG TARGETOS=linux
+ARG TARGETARCH=arm
+
+WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+COPY resource ./resource
+
+# 测试在构建平台原生执行；交叉编译显式 GOARM=7
+RUN go test ./... \
+    && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" GOARM=7 \
+       go build -trimpath \
+       -ldflags="-s -w -X yyb_go/internal/version.Version=${VERSION} -X yyb_go/internal/version.Commit=${COMMIT} -X yyb_go/internal/version.BuildDate=${BUILD_DATE}" \
+       -o /out/yyb-go ./cmd/yyb-go
+
+FROM --platform=linux/arm/v7 alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata wget \
+    && addgroup -S yyb \
+    && adduser -S -G yyb -h /app yyb
+
+WORKDIR /app
+ENV TZ=Asia/Shanghai
+COPY --from=build /out/yyb-go /app/yyb-go
+COPY resource /tmp/resource-src
+
+RUN mkdir -p /app/resource \
+    && cp -R /tmp/resource-src/. /app/resource/ \
+    && chown -R yyb:yyb /app/resource \
+    && find /app/resource -type d -exec chmod 755 {} + \
+    && find /app/resource -type f -exec chmod 644 {} + \
+    && rm -rf /tmp/resource-src
+
+USER yyb
+EXPOSE 8000
+
+ENTRYPOINT ["/app/yyb-go"]
+CMD ["-host", "0.0.0.0", "-port", "8000", "-resource-root", "/app/resource"]
