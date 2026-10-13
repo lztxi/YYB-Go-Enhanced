@@ -33,7 +33,13 @@ RUN go test ./... \
        -ldflags="-s -w -X yyb_go/internal/version.Version=${VERSION} -X yyb_go/internal/version.Commit=${COMMIT} -X yyb_go/internal/version.BuildDate=${BUILD_DATE}" \
        -o /out/yyb-go ./cmd/yyb-go
 
-FROM --platform=linux/arm/v7 alpine:3.21
+# 运行层平台由构建命令的 --platform 决定（Actions 传 linux/arm/v7；本机构建即本机架构）。
+# 不写死 --platform 是 buildx 的 lint 规则要求（FromPlatformFlagConstDisallowed）。
+FROM alpine:3.21
+
+# 维护执行器切换镜像前会校验该 label 与检查到的版本一致
+ARG VERSION=0.2.16
+LABEL org.opencontainers.image.version=$VERSION
 
 RUN apk add --no-cache ca-certificates tzdata wget \
     && addgroup -S yyb \
