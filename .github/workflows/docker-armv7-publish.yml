@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ★ 核心步骤：把官方在线更新地址替换为当前仓库
       #   - internal/httpapi/maintenance.go  版本检查（raw + api 两个 URL）
@@ -58,18 +58,42 @@ jobs:
         run: |
           set -Eeuo pipefail
           repo_u="${REPO//\//_}"
-          files=$(grep -rl "525815266" --include='*.go' . || true)
-          if [[ -z "$files" ]]; then
-            echo "::warning::未找到官方地址，上游可能已改动代码结构，请人工确认"
-            exit 0
+          repo_lower="${REPO,,}"
+
+          # 1) Go 源码：版本检查 / update_url / 青龙脚本仓库
+          go_files=$(grep -rl "525815266" --include='*.go' . || true)
+          if [[ -n "$go_files" ]]; then
+            sed -i "s|525815266/YYB-Go-Enhanced|${REPO}|g; s|525815266_YYB-Go-Enhanced|${repo_u}|g" $go_files
+          else
+            echo "::warning::Go 源码未找到官方地址，上游可能已改动代码结构，请人工确认"
           fi
-          sed -i "s|525815266/YYB-Go-Enhanced|${REPO}|g; s|525815266_YYB-Go-Enhanced|${repo_u}|g" $files
+
+          # 2) 维护执行器 agent.py：官方镜像白名单改为你自己的 ghcr 仓库并放行 armv7 标签。
+          #    补丁后的文件在本次运行的 Artifacts 中（yyb-maintenance-agent-py），供宿主机安装。
+          if [[ -f packaging/maintenance/agent.py ]]; then
+            sed -i "s|ghcr.io/525815266/yyb-go-enhanced|ghcr.io/${repo_lower}|g" packaging/maintenance/agent.py
+            sed -i "s|OFFICIAL_IMAGE + ':latest', OFFICIAL_IMAGE + ':main')|OFFICIAL_IMAGE + ':latest', OFFICIAL_IMAGE + ':main', OFFICIAL_IMAGE + ':armv7')|" packaging/maintenance/agent.py
+            if grep -q "525815266" packaging/maintenance/agent.py; then
+              echo "::error::agent.py 仍有官方地址残留"; exit 1
+            fi
+            grep -q "OFFICIAL_IMAGE + ':armv7'" packaging/maintenance/agent.py || { echo "::error::agent.py 未放行 armv7 标签"; exit 1; }
+          else
+            echo "::warning::未找到 packaging/maintenance/agent.py，跳过执行器补丁"
+          fi
+
+          if grep -rq "525815266" --include='*.go' --include='*.py' .; then
+            echo "::error::仍有官方地址残留"; grep -rn "525815266" --include='*.go' --include='*.py' .; exit 1
+          fi
           echo "== 替换后核对 =="
           grep -rn "maintenanceVersionURL\|maintenanceVersionAPIURL\|update_url\|QingLongRepo = " internal/httpapi/ || true
-          if grep -rq "525815266" --include='*.go' .; then
-            echo "::error::仍有官方地址残留"; grep -rn "525815266" --include='*.go' .; exit 1
-          fi
+          grep -n "OFFICIAL_IMAGE" packaging/maintenance/agent.py || true
           echo "update URLs -> ${REPO}"
+
+      - name: Upload patched maintenance agent
+        uses: actions/upload-artifact@v4
+        with:
+          name: yyb-maintenance-agent-py
+          path: packaging/maintenance/agent.py
 
       - name: Resolve version
         id: ver
@@ -86,15 +110,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -118,7 +142,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and Push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.armv7
