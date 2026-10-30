@@ -21,6 +21,8 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 
 	"yyb_go/internal/auth"
+	"yyb_go/internal/eventlog"
+	"yyb_go/internal/pcmgr"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/proxysource"
 	"yyb_go/internal/qr"
@@ -64,13 +66,15 @@ type Config struct {
 }
 
 type App struct {
+	events             *eventlog.Logger
 	updates            *updateChecker
 	cfg                Config
 	resources          resources
 	db                 *store.DB
 	pool               *protocol.Pool
 	qr                 *qr.Client
-	refreshLoginBuffer func(context.Context, protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error)
+	refreshCredentials func(context.Context, protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error)
+	fetchLoginBuffer   func(context.Context, protocol.LoginBufferCredentials) (string, error)
 	exchangeAuthCode   func(context.Context, string) (protocol.LoginBufferResult, error)
 	fetchUserInfo      func(context.Context, protocol.LoginBufferCredentials) (map[string]any, error)
 	qinglong           *qingLongClient
@@ -125,7 +129,7 @@ func NewApp(cfg Config) (*App, error) {
 		cfg.QRSessionTTL = 5 * time.Minute
 	}
 	if cfg.KeepAliveInterval > 0 && cfg.KeepAliveAhead <= 0 {
-		cfg.KeepAliveAhead = 45 * time.Minute
+		cfg.KeepAliveAhead = 4 * time.Minute
 	}
 	if cfg.QingLongServer == "" {
 		cfg.QingLongServer = "yyb-go:8000"
@@ -181,7 +185,8 @@ func NewApp(cfg Config) (*App, error) {
 		db:                 db,
 		pool:               pool,
 		qr:                 qrClient,
-		refreshLoginBuffer: qrClient.RefreshLoginBuffer,
+		refreshCredentials: qrClient.LoginBuffers().RefreshCredentials,
+		fetchLoginBuffer:   qrClient.LoginBuffers().FetchLoginBuffer,
 		exchangeAuthCode:   qrClient.GetLoginBufferFromCode,
 		fetchUserInfo:      qrClient.LoginBuffers().FetchUserInfo,
 		qinglong:           newQingLongClient(cfg.QingLongType, cfg.QingLongURL, cfg.QingLongClientID, cfg.QingLongSecret, cfg.RequestTimeout),
@@ -213,6 +218,16 @@ func NewApp(cfg Config) (*App, error) {
 		}
 		app.auth = authStore
 	}
+	app.events, err = eventlog.New(db)
+	if err != nil {
+		if app.auth != nil {
+			_ = app.auth.Close()
+		}
+		_ = db.Close()
+		return nil, err
+	}
+	pool.SetEventLogger(app.events)
+	app.events.Emit("system.started", eventlog.Fields{})
 	app.startKeepAlive()
 	app.startAccountLinkCleanup()
 	return app, nil
@@ -231,6 +246,8 @@ func (a *App) Close() error {
 		a.stopAccountLinkCleanup()
 	}
 	if a.db != nil {
+		a.events.Emit("system.stopped", eventlog.Fields{})
+		a.events.Close()
 		if a.auth != nil {
 			_ = a.auth.Close()
 		}
@@ -245,7 +262,7 @@ func (a *App) Handler() http.Handler {
 	}
 
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery())
+	router.Use(a.logRequests(), gin.Logger(), gin.Recovery())
 
 	router.Any("/login", gin.WrapF(a.handleLogin))
 	router.Any("/register", gin.WrapF(a.handleRegister))
@@ -305,9 +322,12 @@ func (a *App) Handler() http.Handler {
 	router.Any("/api/auth/me", gin.WrapF(a.handleAuthMe))
 	router.GET("/api/version", gin.WrapF(a.handleVersion))
 	router.GET("/maintenance", gin.WrapF(a.handleMaintenancePage))
+	router.GET("/logs", gin.WrapF(a.handleSystemLogsPage))
+	router.GET("/api/system-logs", gin.WrapF(a.handleSystemLogs))
 	router.GET("/api/maintenance", gin.WrapF(a.handleMaintenance))
 	router.POST("/api/maintenance", gin.WrapF(a.handleMaintenance))
 	router.Any("/api/auth/profile", gin.WrapF(a.handleProfile))
+	router.Any("/api/scan-settings", gin.WrapF(a.handleScanSettings))
 	router.Any("/api/auth/password", gin.WrapF(a.handlePassword))
 	router.Any("/api/auth/sessions", gin.WrapF(a.handleSessions))
 	router.Any("/api/auth/users", gin.WrapF(a.handleUsers))
@@ -331,6 +351,7 @@ func (a *App) Handler() http.Handler {
 	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
 	router.Any("/accounts/repair", gin.WrapF(a.handleAccountRepair))
 	router.Any("/accounts/compact", gin.WrapF(a.handleAccountCompact))
+	router.Any("/accounts/merge", gin.WrapF(a.handleAccountMerge))
 	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
 	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
 	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
@@ -441,7 +462,8 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if _, err := normalizeLoginProduct(body.Product); err != nil {
+	product, err := a.scanProduct(r, body.Product)
+	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
@@ -457,7 +479,7 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	img, err := client.GetQRCodeImage(ctx)
+	img, err := client.GetQRCodeImageForProduct(ctx, product)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -482,6 +504,7 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		basePath = "/wx/qrcodeauth"
 	}
 	out := map[string]any{
+		"product":    product,
 		"session_id": img.Session.ID,
 		"status":     img.Session.Status,
 		"image_url":  basePath + "/" + img.Session.ID + "/image",
@@ -828,13 +851,13 @@ func (a *App) handleNamedWXOperation(w http.ResponseWriter, r *http.Request, pat
 			writeError(w, http.StatusNotFound, "account not found: "+body.Ref)
 			return
 		case errors.As(err, &expired):
-			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+			writeAccountExpired(w, expired)
 			return
 		case strings.Contains(err.Error(), " is required"):
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
+		writeProtocolCallError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -1004,9 +1027,9 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		var expired accountExpiredError
 		switch {
 		case errors.As(err, &expired):
-			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+			writeAccountExpired(w, expired)
 		default:
-			writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
+			writeProtocolCallError(w, err)
 		}
 		return
 	}
@@ -1220,7 +1243,11 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 	nick := pickNickname(userInfo, creds.Nickname)
 	avatar := a.resolveAvatar(ctx, openid, userInfo)
 	status := "alive"
-	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMapForScan(), &status)
+	acc, err := a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMapForScan(), &status)
+	if err == nil {
+		a.events.Emit("account.scanned", eventlog.ForAccount(acc))
+	}
+	return acc, err
 }
 
 func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*store.WechatAccount, error) {
@@ -1235,19 +1262,36 @@ func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*sto
 	return a.db.GetAccount(ctx, acc.ID)
 }
 
-type accountExpiredError struct{ openid string }
+type accountExpiredError struct {
+	accountID int64
+	openid    string
+	cause     error
+}
 
 func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
 
-func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
+func (e accountExpiredError) Unwrap() error { return e.cause }
+
+func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (resultOut map[string]any, errOut error) {
+	started := time.Now()
+	defer func() {
+		fields := eventlog.ForAccount(acc)
+		fields.DurationMS = time.Since(started).Milliseconds()
+		fields.Rejections = eventRejections(errOut)
+		event := "protocol.succeeded"
+		if errOut != nil {
+			event = "protocol.failed"
+		}
+		a.events.Emit(event, fields)
+	}()
 	// Bound queueing, protocol login and any credential recovery together.
 	ctx, cancel := context.WithTimeout(ctx, a.cfg.RequestTimeout+35*time.Second)
 	defer cancel()
 	if accountStatus(acc) == "expired" {
-		return nil, accountExpiredError{openid: acc.OpenID}
+		return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID}
 	}
 	if accountNeedsRescan(acc) {
-		return nil, accountExpiredError{openid: acc.OpenID}
+		return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID}
 	}
 	proxyValue, fallbackDirect, err := a.resolveWXAppProxy(ctx, acc.ID)
 	if err != nil {
@@ -1257,31 +1301,106 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if callErr == nil {
 		return result, nil
 	}
+	current, snapshotErr := a.db.GetAccount(ctx, acc.ID)
+	if errors.Is(callErr, store.ErrAccountAuthorizationChanged) || errors.Is(callErr, store.ErrSessionChanged) || snapshotErr == nil && !current.SameAuthorization(acc) {
+		return nil, store.ErrAccountAuthorizationChanged
+	}
+	if acc.SessionOnly() {
+		if errors.Is(callErr, protocol.ErrCachedSessionUnavailable) {
+			applied, err := a.db.ApplyCredentialRefresh(ctx, acc, "", nil, "expired")
+			if err != nil {
+				return nil, err
+			}
+			if !applied {
+				return nil, store.ErrAccountAuthorizationChanged
+			}
+			return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID, cause: callErr}
+		}
+		// A request using the retained PSK cannot trigger OAuth or ManualAuth.
+		return nil, callErr
+	}
+	var codeRecovery *protocol.CodeSessionRecoveryError
+	if errors.Is(callErr, protocol.ErrLoginCodeUnavailable) || protocol.IsApplicationRequestRejection(callErr) || errors.As(callErr, &codeRecovery) {
+		// An empty code or a bare authenticated application -14 does not
+		// establish account expiry. Other apps may use this same session.
+		return nil, callErr
+	}
+	var rejected *protocol.ManualAuthRejectedError
+	bufferRejected := errors.As(callErr, &rejected) && rejected.Code == -10
 	var networkErr net.Error
-	if ctx.Err() != nil || errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) || errors.As(callErr, &networkErr) || errors.Is(callErr, io.EOF) || errors.Is(callErr, io.ErrUnexpectedEOF) {
+	if ctx.Err() != nil || (!bufferRejected && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) || errors.As(callErr, &networkErr) || errors.Is(callErr, io.EOF) || errors.Is(callErr, io.ErrUnexpectedEOF))) {
 		// A failed transport does not establish that saved credentials expired.
 		// Preserve the session and original diagnostic; do not repeat a slow call.
 		return nil, callErr
 	}
-	_ = a.db.InvalidateSession(ctx, acc.ID, proxyValue)
+	if bufferRejected {
+		// ManualAuth rejected the saved buffer before sending the operation.
+		// The access token may still be usable: fetch a fresh buffer without
+		// rotating tokens or changing scan/expiry timestamps. Pool persists the
+		// replacement protocol session, so no account credential write is needed.
+		buffer, bufferErr := a.fetchAccountLoginBuffer(ctx, acc)
+		if bufferErr == nil {
+			fresh := *acc
+			fresh.LoginBuffer = buffer
+			result, retryErr := call(ctx, &fresh, appID, payload, proxyValue, fallbackDirect)
+			if retryErr != nil {
+				return nil, errors.Join(callErr, fmt.Errorf("retry with fresh login buffer: %w", retryErr))
+			}
+			return result, nil
+		}
+		callErr = errors.Join(callErr, fmt.Errorf("fetch fresh login buffer: %w", bufferErr))
+		var pcRejected *pcmgr.BufferRejectedError
+		if errors.As(bufferErr, &pcRejected) && pcRejected.Code == 1 {
+			// Native DLL and Go both return this generic ticket refusal even
+			// when renewing the account key succeeds. Do not rotate a key on
+			// every API test or misclassify it as a revoked account credential.
+			return nil, callErr
+		}
+		if ctx.Err() != nil || errors.Is(bufferErr, context.Canceled) || errors.Is(bufferErr, context.DeadlineExceeded) || errors.As(bufferErr, &networkErr) || errors.Is(bufferErr, io.EOF) || errors.Is(bufferErr, io.ErrUnexpectedEOF) {
+			return nil, callErr
+		}
+	}
+	_ = a.db.InvalidateSessionForAccount(ctx, acc, proxyValue)
 	// Credential recovery always uses the account's refresh route, even when
 	// this protocol call explicitly selected direct egress.
 	status, _, refreshErr := a.refreshAccount(ctx, acc, true)
 	status = a.finishLivenessRefresh(ctx, acc, status)
 	if status != "alive" {
 		if status == "expired" {
-			return nil, accountExpiredError{openid: acc.OpenID}
+			return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID, cause: errors.Join(callErr, refreshErr)}
 		}
-		return nil, fmt.Errorf("refresh account credentials: %w", refreshErr)
+		return nil, errors.Join(callErr, fmt.Errorf("refresh account credentials: %w", refreshErr))
 	}
 	if refreshErr != nil {
-		return nil, fmt.Errorf("refresh account credentials: %w", refreshErr)
+		return nil, errors.Join(callErr, fmt.Errorf("refresh account credentials: %w", refreshErr))
 	}
 	fresh, err := a.db.GetAccount(ctx, acc.ID)
 	if err == nil && fresh != nil {
 		acc = fresh
 	}
 	return call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
+}
+
+func (a *App) fetchAccountLoginBuffer(ctx context.Context, acc *store.WechatAccount) (string, error) {
+	// Credential requests follow the account's configured egress, even when
+	// protocol calls explicitly use direct networking.
+	proxyValue, fallbackDirect, err := a.resolveAccountProxy(ctx, acc.ID)
+	if err != nil {
+		return "", err
+	}
+	creds := protocol.CredentialsFromMap(acc.Credentials)
+	return a.fetchLoginBufferWithProxy(ctx, creds, proxyValue, fallbackDirect)
+}
+
+func (a *App) fetchLoginBufferWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (string, error) {
+	if proxyValue == "" {
+		return a.fetchLoginBuffer(ctx, creds)
+	}
+	client, err := qr.NewClientWithProxy(a.cfg.RequestTimeout, proxyValue, fallbackDirect)
+	if err != nil {
+		return "", err
+	}
+	return client.LoginBuffers().FetchLoginBuffer(ctx, creds)
 }
 
 // accountNeedsRescan covers accounts whose refresh attempt was inconclusive
@@ -1292,28 +1411,40 @@ func accountNeedsRescan(acc *store.WechatAccount) bool {
 		return false
 	}
 	expiresAt := protocol.CredentialsFromMap(acc.Credentials).ExpiresAt
+	if protocol.CredentialsFromMap(acc.Credentials).Provider == "pcmgr" {
+		return false
+	}
 	return expiresAt > 0 && expiresAt <= time.Now().Unix()
 }
 
 func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect)
+	result, err := a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect, acc)
+	if err == nil || !protocol.IsApplicationRequestRejection(err) {
+		return result, err
+	}
+	return a.pool.RecoverCodeSession(ctx, acc, appID, proxyValue, fallbackDirect, err, func(ctx context.Context) (string, error) {
+		return a.fetchAccountLoginBuffer(ctx, acc)
+	})
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
-	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect)
+	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect, acc)
 }
 
 func (a *App) invokeOperateWXData(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
-	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, proxyValue, fallbackDirect)
+	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, proxyValue, fallbackDirect, acc)
 }
 
 func refreshOut(acc *store.WechatAccount, status string, refreshErr error) map[string]any {
 	out := map[string]any{
 		"id": acc.ID, "openid": acc.OpenID, "uin": acc.UIN, "nickname": acc.Nickname,
-		"status": status, "rescan_required": status == "expired",
+		"status": status, "rescan_required": status == "expired" || status == store.StatusSessionOnly,
 	}
 	if refreshErr != nil {
 		out["refresh_error"] = refreshErr.Error()
+		if diagnostics := credentialDiagnostics(refreshErr); len(diagnostics) > 0 {
+			out["upstream_errors"] = diagnostics
+		}
 	}
 	return out
 }
