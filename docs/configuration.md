@@ -224,6 +224,67 @@ YYB_NOTIFY_ACCOUNT_PUSH=true
 
 推送内容只含账号编号、备注 / 昵称、渠道、状态、时间和数字诊断码，不含 OpenID、凭据或 token。发送是异步的，不阻塞续期和协议请求；结果记录在“运行日志”的 `account.notified` / `account.notify_failed`。
 
+## 取码熔断（v0.2.59 起）
+
+```dotenv
+YYB_CIRCUIT_BREAKER=on
+```
+
+默认 `on`。熔断只控制流量，从不修改账号状态、清空凭据或触发续期；被熔断的请求立即返回 HTTP `429`（带 `Retry-After` 和 `data.circuit_open`），不再发往上游，与上游 `502`、重扫 `409` 区分，脚本应据此退避。
+
+- **目标层：** 同一账号 + AppID + 请求类型（取码 / 取号 / operateWxData）在 30 分钟内连续 2 次被应用层 `-14` 拒绝，或连续 3 次返回空 code，暂停该目标 10 分钟。取号 / operateWxData 被拒不会拦住同 AppID 的取码（v0.2.60 起）。
+- **会话层：** 同一账号 5 分钟内有 3 个不同 AppID 的取码被 `-14` 拒绝，暂停该账号全部业务请求 15 分钟。
+- 一次成功清空该账号的会话层和对应目标；重新扫码、手动置失效也会清空。
+- 记录：运行日志 `protocol.circuit_open` / `protocol.circuit_deferred`，v0.2.60 起事件带 `app_id` 与请求类型。
+- 设为 `off` 恢复旧行为；阈值为编译期默认值。详见[取码熔断与触发规律](code-circuit-breaker-20261101.md)。
+
+## 登录预算与取码限速（v0.2.61 起）
+
+```dotenv
+YYB_LOGIN_BUDGET=3
+YYB_LOGIN_WINDOW=10m
+```
+
+同一账号因业务请求触发的 OAuth 层调用（新的登录票据、ManualAuth 恢复、强制刷新）在 `YYB_LOGIN_WINDOW` 内最多 `YYB_LOGIN_BUDGET` 次（默认 10 分钟 3 次）。用完后，本来要重新登录的请求保持它自己的错误（取码是原来的 `-14`），不再向上游登录，也不登记该 AppID 的退避，缓存会话也不作废；窗口滑过后同一 AppID 仍可修复。后台续期和面板手动刷新不受限。`off` 或 `0` 关闭。拒绝只汇总成 `protocol.login_limited` 事件。依据和验证方法见[任务高峰、重新登录与登录预算](code-pacing-20261102.md)。
+
+取码限速默认开启：
+
+```dotenv
+YYB_CODE_MIN_GAP=3s
+YYB_CODE_MAX_WAIT=20s
+```
+
+同一账号向上游发出的取码 / 取号 / operateWxData 请求至少相隔 `YYB_CODE_MIN_GAP`，槽距现在超过 `YYB_CODE_MAX_WAIT` 的请求立即返回 HTTP `429`（带 `Retry-After`，`data.circuit_open` 为 `pacing`），不访问上游，也不修改账号状态；`0` 或 `off` 关闭。熔断和登录预算只统计失败与 OAuth 层调用，一个全部成功的突发它们拦不住，限速补的就是这个缺口。依据和限制见[任务高峰、重新登录与登录预算](code-pacing-20261102.md)。
+
+不重启就要调整时，在数据库目录（Compose 默认 `data/db`）放一个 `tuning.json`，一秒内生效：
+
+```json
+{"login_budget": 3, "login_window_ms": 600000, "code_min_gap_ms": 3000, "code_max_wait_ms": 20000, "fresh_session_window_ms": 120000}
+```
+
+缺少的键沿用上面的配置值，文件无法解析时保留上一次有效设置，删除文件恢复配置值。
+
+## 刚成功后的 `-14` 保护（v0.2.65 起可调）
+
+```dotenv
+YYB_FRESH_SESSION_WINDOW=2m
+```
+
+同一账号的会话刚取到过 code 后的这段时间内，单个 AppID 的 `-14` 被当成该 AppID 自己的拒绝，不再取新票据重新登录（v0.2.60 起，之前写死为 2 分钟）。默认 `2m`，行为不变；`off` 或 `0` 关闭；也可以写成其他时长。`tuning.json` 的 `fresh_session_window_ms` 不重启生效（`0` 关闭，上限 1 小时）。
+
+什么时候需要动它：脚本在同一账号上批量取不同 AppID 的 code，而这个账号的会话用一次就要重新登录才能换下一个 AppID 时，这个保护会把本来能修好的 `-14` 放弃，随后会话熔断（3 个不同 AppID 的 `-14` 暂停整号 15 分钟）又把这些 `-14` 当成整个会话被拒。实验室里同样的 40 个 AppID，默认只拿到 1 个，关闭后拿到 40 个。要接近这个取码量，还要同时放开 `YYB_LOGIN_BUDGET` 和 `YYB_CODE_MIN_GAP`；熔断可以保持开启。代价是本机不再替你限制密集登录，而密集登录是否会让授权被吊销目前没有答案，所以默认值没有改。数据、限制和复现方式见[取码量对照实验](dense-batch-lab-20261103.md)。
+
+## 取码 AppID 保护
+
+v0.2.63 起，取码请求带着已知的网站应用 AppID（腾讯电脑管家 `wx5cd60c5d4817a188`、京东网页登录护照 `wx2f5d8f9715c59d10`）时，服务端直接返回 `403`，请求不发往上游。依据见[网站应用 AppID 取码与授权失效](website-appid-getcode-20261103.md)。
+
+```dotenv
+YYB_CODE_ALLOW_APPIDS=
+YYB_CODE_DENY_APPIDS=
+```
+
+两项都是逗号或空格分隔的 AppID 列表，大小写不敏感。`YYB_CODE_ALLOW_APPIDS` 放行指定 AppID，优先级最高；`YYB_CODE_DENY_APPIDS` 在内置名单之外追加自己的禁用名单。被拒绝的请求不占限速槽位、不进熔断计数，日志里记为 `protocol.appid_denied`。只影响取码请求，取号和 operateWxData 不受影响。
+
 ## 数据目录与备份
 
 Compose 默认持久化：

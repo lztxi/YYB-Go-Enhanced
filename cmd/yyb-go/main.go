@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"yyb_go/internal/httpapi"
+	"yyb_go/internal/protocol"
 )
 
 func main() {
@@ -147,6 +150,34 @@ func main() {
 		DisableAccountPushNotify: strings.EqualFold(strings.TrimSpace(os.Getenv("YYB_NOTIFY_ACCOUNT_PUSH")), "false"),
 
 		DisableCircuitBreaker: strings.EqualFold(strings.TrimSpace(os.Getenv("YYB_CIRCUIT_BREAKER")), "off"),
+
+		// Upstream requests of one account are spaced by default. The breaker and
+		// the login budget only react to failures and OAuth calls, so a burst of
+		// successful codes would pass both.
+		CodeMinGap:  envDuration("YYB_CODE_MIN_GAP", defaultCodeMinGap),
+		CodeMaxWait: envDuration("YYB_CODE_MAX_WAIT", 20*time.Second),
+		LoginBudget: envInt("YYB_LOGIN_BUDGET", protocol.DefaultLoginBudget),
+		LoginWindow: envDuration("YYB_LOGIN_WINDOW", protocol.DefaultLoginWindow),
+
+		// A -14 shortly after a success is not repaired with a new login. On
+		// accounts whose session serves one code that refuses the repair that
+		// would work, so the window can be shortened or switched off.
+		FreshSessionWindow: envFreshSessionWindow("YYB_FRESH_SESSION_WINDOW"),
+
+		// Website-application AppIDs never get a code and cost the account its
+		// authorization, so code requests refuse the known ones by default.
+		CodeDenyAppIDs:  envList("YYB_CODE_DENY_APPIDS"),
+		CodeAllowAppIDs: envList("YYB_CODE_ALLOW_APPIDS"),
+
+		// An AppID whose code request reaches the upstream and comes back
+		// without a code is learned as dangerous and denied for every account;
+		// YYB_CODE_DYNAMIC_DENY=0 switches the learning off.
+		DisableDynamicAppIDDeny: !envBool("YYB_CODE_DYNAMIC_DENY", true),
+
+		// How many distinct accounts must fail an AppID before it is denied
+		// (or dynamicAppIDDenyTotalStrikes failures in total); default is 2,
+		// so one bursted account cannot deny AppIDs other accounts still use.
+		CodeDynamicDenyThreshold: envInt("YYB_CODE_DYNAMIC_DENY_THRESHOLD", 2),
 	}
 
 	if *resetAdmin != "" {
@@ -187,6 +218,84 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+// defaultCodeMinGap is the least time between two upstream requests of one
+// account. It is a conservative starting point, not a measured safe rate: the
+// one burst that got an authorization rejected after successful requests alone
+// came in at about 1.6 requests a second.
+const defaultCodeMinGap = 3 * time.Second
+
+// envList reads a list separated by commas or white space. An unset or empty
+// value gives no entries.
+func envList(key string) []string {
+	return strings.FieldsFunc(os.Getenv(key), func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
+}
+
+// envDuration reads a Go duration such as "2s". "off" and "0" mean zero, which
+// switches the setting off. An empty or unreadable value keeps the default and
+// says so, instead of silently running with a different value.
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if strings.EqualFold(raw, "off") {
+		return 0
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value < 0 {
+		log.Printf("%s=%q is not a valid duration; using %s", key, raw, fallback)
+		return fallback
+	}
+	return value
+}
+
+// envInt reads a whole number. "off" means zero, which switches the setting
+// off; an unreadable value keeps the default and says so.
+// envFreshSessionWindow reads the fresh-session guard window: unset keeps the
+// default, 0 or off switches the guard off (a negative Config value), anything
+// else is the window.
+func envFreshSessionWindow(key string) time.Duration {
+	window := envDuration(key, protocol.DefaultFreshSessionWindow)
+	if window == 0 {
+		return -1
+	}
+	return window
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if strings.EqualFold(raw, "off") {
+		return 0
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		log.Printf("%s=%q is not a valid whole number; using %d", key, raw, fallback)
+		return fallback
+	}
+	return value
+}
+
+// envBool reads a switch: 1/true/on enable, 0/false/off disable. An unset or
+// unreadable value keeps the fallback.
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "on", "yes":
+		return true
+	case "0", "false", "off", "no":
+		return false
+	default:
+		log.Printf("%s=%q is not a valid switch; using %v", key, raw, fallback)
+		return fallback
+	}
 }
 
 func getEnvWithFallback(keys ...string) string {

@@ -78,6 +78,42 @@ type Config struct {
 	// DisableCircuitBreaker turns off the local target/session hold-off that
 	// stops repeating an upstream-rejected request.
 	DisableCircuitBreaker bool
+
+	// CodeMinGap spaces the upstream requests of one account; zero turns
+	// pacing off. CodeMaxWait is the longest a request queues for its slot
+	// before it is refused locally. tuning.json beside the database overrides
+	// both without a restart.
+	CodeMinGap  time.Duration
+	CodeMaxWait time.Duration
+
+	// LoginBudget caps the OAuth-layer calls (new login tickets, forced
+	// refreshes) that business traffic may cause per account inside
+	// LoginWindow; zero disables it. tuning.json overrides both at run time.
+	LoginBudget int
+	LoginWindow time.Duration
+
+	// FreshSessionWindow is how long after a successful code a -14 is treated as
+	// the AppID's own refusal and not repaired with a new login. Zero keeps the
+	// default (protocol.DefaultFreshSessionWindow), so a Config that does not
+	// set it behaves as before; a negative value switches the guard off.
+	// tuning.json overrides it at run time.
+	FreshSessionWindow time.Duration
+
+	// CodeDenyAppIDs adds AppIDs that code requests refuse on top of the
+	// built-in website-application AppIDs; CodeAllowAppIDs lifts a refusal and
+	// wins over both lists.
+	CodeDenyAppIDs  []string
+	CodeAllowAppIDs []string
+
+	// DisableDynamicAppIDDeny turns off the learned deny list: an AppID whose
+	// wx.login code request reaches the upstream and comes back without a code
+	// is otherwise denied for every account and remembered across restarts.
+	DisableDynamicAppIDDeny bool
+
+	// CodeDynamicDenyThreshold is how many distinct accounts must fail an
+	// AppID before it is denied (a fixed total of failures denies it too, so
+	// single-account deployments are covered); zero keeps the default of two.
+	CodeDynamicDenyThreshold int
 }
 
 type App struct {
@@ -97,6 +133,9 @@ type App struct {
 	auth               *auth.Store
 	notifier           *offlineNotifier
 	circuit            *circuitBreaker
+	appIDs             *appIDPolicy
+	dynamicAppIDs      *dynamicAppIDDeny
+	pacer              *accountPacer
 
 	mu                sync.Mutex
 	qrSessions        map[string]*qrLoginSession
@@ -222,8 +261,15 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.SessionTTL = cfg.SessionTTL
 	poolCfg.ShortlinkTimeout = cfg.RequestTimeout
 	poolCfg.DeviceIdentity = cfg.DeviceIdentity
+	// Zero disables the login budget, so a Config that does not set it (tests,
+	// embedders) keeps the previous behaviour; main supplies the defaults.
+	poolCfg.LoginBudget = cfg.LoginBudget
+	poolCfg.LoginWindow = cfg.LoginWindow
+	poolCfg.FreshSessionWindow = cfg.FreshSessionWindow
 	pool := protocol.NewPool(poolCfg, db)
 	qrClient := qr.NewClient(cfg.RequestTimeout)
+	// The traffic limiter's configured values; tuning.json may override them at run time.
+	trafficSettings := pacingSettings{MinGap: cfg.CodeMinGap, MaxWait: cfg.CodeMaxWait, LoginBudget: cfg.LoginBudget, LoginWindow: cfg.LoginWindow, FreshWindow: protocol.EffectiveFreshWindow(cfg.FreshSessionWindow)}
 	app := &App{
 		updates:            newUpdateChecker(cfg.UpdateProxy, cfg.UpdateVersionURL),
 		cfg:                cfg,
@@ -239,6 +285,9 @@ func NewApp(cfg Config) (*App, error) {
 		qinglong:           newQingLongClient(cfg.QingLongType, cfg.QingLongURL, cfg.QingLongClientID, cfg.QingLongSecret, cfg.RequestTimeout),
 		notifier:           newOfflineNotifier(offlineNotifyTimeout),
 		circuit:            newCircuitBreaker(circuitConfigFor(cfg.DisableCircuitBreaker)),
+		appIDs:             newAppIDPolicy(cfg.CodeDenyAppIDs, cfg.CodeAllowAppIDs),
+		dynamicAppIDs:      newDynamicAppIDDeny(db, cfg.CodeDynamicDenyThreshold, cfg.CodeAllowAppIDs, cfg.DisableDynamicAppIDDeny),
+		pacer:              newAccountPacer(filepath.Join(res.DB, "tuning.json"), trafficSettings),
 		qrSessions:         map[string]*qrLoginSession{},
 		quickSessions:      map[string]quickLoginSession{},
 		loginAttempts:      map[string]loginAttempt{},
@@ -246,6 +295,12 @@ func NewApp(cfg Config) (*App, error) {
 		proxyLeases:        map[int64]accountProxyLease{},
 		proxyLeaseLocks:    map[int64]chan struct{}{},
 		keepAliveRetryAt:   map[int64]time.Time{},
+	}
+	// tuning.json changes the login budget and the fresh-session guard of the
+	// running pool without a restart.
+	app.pacer.onChange = func(s pacingSettings) {
+		pool.SetLoginBudget(s.LoginBudget, s.LoginWindow)
+		pool.SetFreshSessionWindow(s.FreshWindow)
 	}
 	authDriver, authDSN, err := cfg.AuthDatabase()
 	if err != nil {
@@ -346,6 +401,8 @@ func (a *App) Handler() http.Handler {
 	protocolRoutes.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	protocolRoutes.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
 	protocolRoutes.Any("/wx/code", gin.WrapF(a.handleWXCodeAlias))
+	protocolRoutes.Any("/wx/h5code", gin.WrapF(a.handleH5Code))
+	protocolRoutes.Any("/wxapp/getH5Code", gin.WrapF(a.handleH5CodeAlias))
 	protocolRoutes.Any("/wx/getuserinfo", gin.WrapF(a.handleWXGetUserInfo))
 	protocolRoutes.Any("/wx/encryptkey", gin.WrapF(a.handleWXEncryptKey))
 	protocolRoutes.Any("/wx/getlatestuserkey", gin.WrapF(a.handleWXLatestUserKey))
@@ -380,6 +437,7 @@ func (a *App) Handler() http.Handler {
 	router.POST("/api/maintenance", gin.WrapF(a.handleMaintenance))
 	router.Any("/api/auth/profile", gin.WrapF(a.handleProfile))
 	router.Any("/api/scan-settings", gin.WrapF(a.handleScanSettings))
+	router.Any("/api/appid-deny", gin.WrapF(a.handleAppIDDeny))
 	router.Any("/api/auth/password", gin.WrapF(a.handlePassword))
 	router.Any("/api/auth/sessions", gin.WrapF(a.handleSessions))
 	router.Any("/api/auth/users", gin.WrapF(a.handleUsers))
@@ -819,35 +877,71 @@ func (a *App) handleGetCode(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wxapp/getCode") {
 		return
 	}
-	a.callWXApp(w, r, false, a.invokeGetCode)
+	a.callWXApp(w, withWXOperation(r, eventlog.OpGetCode), false, a.invokeGetCode)
 }
 
 func (a *App) handleWXCodeAlias(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wx/code") {
 		return
 	}
-	a.callWXApp(w, r, false, a.invokeGetCode)
+	a.callWXApp(w, withWXOperation(r, eventlog.OpGetCode), false, a.invokeGetCode)
+}
+
+// handleH5Code serves POST /wx/h5code: an official-account web OAuth code
+// fetched over the account's own YYB session, for scripts that need the code a
+// WeChat authorization page appends to their redirect_uri. A wx.login code
+// request with these AppIDs returns nothing and costs the account its
+// authorization, so H5 scripts must use this route instead.
+func (a *App) handleH5Code(w http.ResponseWriter, r *http.Request) {
+	if !acceptWXAppRoute(w, r, "/wx/h5code") {
+		return
+	}
+	a.callWXApp(w, withWXOperation(r, eventlog.OpH5Code), false, a.invokeH5Code)
+}
+
+func (a *App) handleH5CodeAlias(w http.ResponseWriter, r *http.Request) {
+	if !acceptWXAppRoute(w, r, "/wxapp/getH5Code") {
+		return
+	}
+	a.callWXApp(w, withWXOperation(r, eventlog.OpH5Code), false, a.invokeH5Code)
+}
+
+// learnDeniedAppID counts a code request that reached the upstream and came
+// back without a code. The AppID is denied once the outcome repeats on the
+// configured number of distinct accounts, because one bursted account can stop
+// receiving codes on every AppID at once (docs/h5-oauth-code.md). Denials
+// persist across restarts and YYB_CODE_ALLOW_APPIDS still overrides them.
+func (a *App) learnDeniedAppID(acc *store.WechatAccount, appID string, callErr error) {
+	if !errors.Is(callErr, protocol.ErrLoginCodeUnavailable) {
+		return
+	}
+	denied := a.dynamicAppIDs.recordStrike(appID, acc.ID)
+	if !denied {
+		return
+	}
+	log.Printf("protocol: app id=%s denied for every account after repeated code requests returned no code (account id=%d); set YYB_CODE_ALLOW_APPIDS to override", appID, acc.ID)
+	a.events.Emit("protocol.appid_dynamic_denied", eventlog.ForAccount(acc).WithTarget(appID, eventlog.OpGetCode, ""))
 }
 
 func (a *App) handleGetPhoneNumber(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wxapp/getPhoneNumber") {
 		return
 	}
-	a.callWXApp(w, r, false, a.invokeGetPhoneNumber)
+	a.callWXApp(w, withWXOperation(r, eventlog.OpGetPhoneNumber), false, a.invokeGetPhoneNumber)
 }
 
 func (a *App) handleWXPhoneAlias(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wx/getphonenumber") {
 		return
 	}
-	a.callWXApp(w, r, false, a.invokeGetPhoneNumber)
+	a.callWXApp(w, withWXOperation(r, eventlog.OpGetPhoneNumber), false, a.invokeGetPhoneNumber)
 }
 
 func (a *App) handleOperateWXData(w http.ResponseWriter, r *http.Request) {
 	if !acceptWXAppRoute(w, r, "/wxapp/operateWxData") {
 		return
 	}
-	a.callWXApp(w, r, true, a.invokeOperateWXData)
+	a.callWXApp(w, withWXOperation(r, eventlog.OpOperateWXData), true, a.invokeOperateWXData)
 }
 
 func (a *App) handleWXEncryptKey(w http.ResponseWriter, r *http.Request) {
@@ -934,7 +1028,7 @@ func (a *App) invokeNamedWXOperation(ctx context.Context, body wxappRequest, api
 	if apiName == encryptKeyOperation {
 		body.Payload = normalizeEncryptKeyPayload(body.Payload)
 	}
-	result, err := a.invokeWXApp(ctx, acc, body.AppID, body.Payload, a.invokeOperateWXData)
+	result, err := a.invokeWXApp(withWXOperationContext(ctx, eventlog.OpOperateWXData), acc, body.AppID, body.Payload, a.invokeOperateWXData)
 	if err != nil {
 		return nil, err
 	}
@@ -1003,6 +1097,12 @@ func (a *App) handleWXGetUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	if accountStatus(acc) == "expired" {
 		writeError(w, http.StatusConflict, "account login_buffer expired; re-scan required")
+		return
+	}
+	// Same gate as /wx/code: an unknown-status account past its cached expiry
+	// must not hit the upstream and turn a lapsed credential into a rejection.
+	if accountNeedsRescan(acc) {
+		writeError(w, http.StatusConflict, "account credentials expired; re-scan required")
 		return
 	}
 	proxyValue, fallbackDirect, err := a.resolveAccountProxy(r.Context(), acc.ID)
@@ -1083,6 +1183,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		case errors.As(err, &expired):
 			writeAccountExpired(w, expired)
 		case writeIfCircuitOpen(w, err):
+		case writeIfAppIDDenied(w, err):
 		default:
 			writeProtocolCallError(w, err)
 		}
@@ -1331,21 +1432,42 @@ func (e accountExpiredError) Unwrap() error { return e.cause }
 
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (resultOut map[string]any, errOut error) {
 	started := time.Now()
+	op := wxOperation(ctx)
 	defer func() {
-		fields := eventlog.ForAccount(acc)
+		fields := eventlog.ForAccount(acc).WithTarget(appID, op, wxAPIName(op, payload))
 		fields.DurationMS = time.Since(started).Milliseconds()
 		fields.Rejections = eventRejections(errOut)
 		event := "protocol.succeeded"
 		var open *circuitOpenError
+		var denied *appIDDeniedError
 		switch {
 		case errors.As(errOut, &open):
+			if open.Scope == "pacing" {
+				// A burst can refuse hundreds of requests a minute; paceWXApp
+				// reports it as one summary event instead of filling the log.
+				return
+			}
 			// A locally short-circuited request never reached the upstream.
 			event = "protocol.circuit_deferred"
+		case errors.As(errOut, &denied):
+			event = "protocol.appid_denied"
 		case errOut != nil:
 			event = "protocol.failed"
 		}
 		a.events.Emit(event, fields)
 	}()
+	// A website-application AppID never gets a code and costs the account its
+	// authorization, so it is refused before anything else looks at the request.
+	// The H5 OAuth route honours the same list: its confirmations are one-time
+	// and a wrong appid family has no business there either.
+	if op == eventlog.OpGetCode || op == eventlog.OpH5Code {
+		if denied := a.appIDs.check(appID); denied != nil {
+			return nil, denied
+		}
+		if why, learned := a.dynamicAppIDs.check(appID); learned {
+			return nil, &appIDDeniedError{AppID: appID, Why: why}
+		}
+	}
 	// Bound queueing, protocol login and any credential recovery together.
 	ctx, cancel := context.WithTimeout(ctx, a.cfg.RequestTimeout+35*time.Second)
 	defer cancel()
@@ -1355,17 +1477,31 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if accountNeedsRescan(acc) {
 		return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID}
 	}
-	if breakerErr := a.circuit.check(acc.ID, appID); breakerErr != nil {
+	if breakerErr := a.circuit.check(acc.ID, appID, op); breakerErr != nil {
 		return nil, breakerErr
+	}
+	// Held-off requests above never take a slot. Everything that reaches the
+	// upstream is spaced per account, so a burst of scripts cannot turn into a
+	// burst of logins on one authorization.
+	if paceErr := a.paceWXApp(ctx, acc); paceErr != nil {
+		return nil, paceErr
 	}
 	proxyValue, fallbackDirect, err := a.resolveWXAppProxy(ctx, acc.ID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve account proxy: %w", err)
 	}
 	result, callErr := call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
-	a.recordCircuitOutcome(acc, appID, callErr)
+	a.recordCircuitOutcome(acc, appID, op, callErr)
 	if callErr == nil {
+		// A code that arrived proves the AppID is not one of the dangerous
+		// website applications; forget any earlier hiccup.
+		if op == eventlog.OpGetCode {
+			a.dynamicAppIDs.recordSuccess(appID)
+		}
 		return result, nil
+	}
+	if op == eventlog.OpGetCode {
+		a.learnDeniedAppID(acc, appID, callErr)
 	}
 	current, snapshotErr := a.db.GetAccount(ctx, acc.ID)
 	if errors.Is(callErr, store.ErrAccountAuthorizationChanged) || errors.Is(callErr, store.ErrSessionChanged) || snapshotErr == nil && !current.SameAuthorization(acc) {
@@ -1384,6 +1520,14 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 			return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID, cause: callErr}
 		}
 		// A request using the retained PSK cannot trigger OAuth or ManualAuth.
+		return nil, callErr
+	}
+	if op == eventlog.OpH5Code {
+		// An H5 authorization confirmation can issue a one-time code, so a
+		// failed request is never replayed after a forced refresh and never
+		// touches the account's credentials: whatever happened upstream is
+		// reported to the script and the keepalive loop stays in charge of the
+		// account's health.
 		return nil, callErr
 	}
 	var codeRecovery *protocol.CodeSessionRecoveryError
@@ -1407,6 +1551,9 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		// The access token may still be usable: fetch a fresh buffer without
 		// rotating tokens or changing scan/expiry timestamps. Pool persists the
 		// replacement protocol session, so no account credential write is needed.
+		if !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
+			return nil, errors.Join(callErr, errLoginBudget)
+		}
 		buffer, bufferErr := a.fetchAccountLoginBuffer(ctx, acc)
 		if bufferErr == nil {
 			fresh := *acc
@@ -1429,12 +1576,18 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 			return nil, callErr
 		}
 	}
+	// A forced refresh is another OAuth-layer call. Past the account's login
+	// budget the request fails with the error it has, and the cached session is
+	// left alone rather than invalidated for a repair that will not happen.
+	if !a.pool.AllowLogin(acc.ID, protocol.ProviderOf(acc)) {
+		return nil, errors.Join(callErr, errLoginBudget)
+	}
 	if !ticketAccessRejected {
 		_ = a.db.InvalidateSessionForAccount(ctx, acc, proxyValue)
 	}
 	// Credential recovery always uses the account's refresh route, even when
 	// this protocol call explicitly selected direct egress.
-	status, _, refreshErr := a.refreshAccount(ctx, acc, true)
+	status, _, refreshErr := a.refreshAccount(withRefreshSource(ctx, eventlog.SourceOnDemand), acc, true)
 	status = a.finishLivenessRefresh(ctx, acc, status)
 	if status != "alive" {
 		if status == "expired" {
@@ -1456,7 +1609,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 // application -14 or an empty code count toward holding a target or session
 // off; network, ManualAuth and OAuth failures are handled elsewhere and never
 // trip it. A success clears the account's breaker state.
-func (a *App) recordCircuitOutcome(acc *store.WechatAccount, appID string, callErr error) {
+func (a *App) recordCircuitOutcome(acc *store.WechatAccount, appID, op string, callErr error) {
 	outcome := circuitOther
 	switch {
 	case callErr == nil:
@@ -1466,8 +1619,8 @@ func (a *App) recordCircuitOutcome(acc *store.WechatAccount, appID string, callE
 	case errors.Is(callErr, protocol.ErrLoginCodeUnavailable):
 		outcome = circuitEmptyCode
 	}
-	if scope := a.circuit.record(acc.ID, appID, outcome); scope != "" {
-		fields := eventlog.ForAccount(acc)
+	if scope := a.circuit.record(acc.ID, appID, op, outcome); scope != "" {
+		fields := eventlog.ForAccount(acc).WithTarget(appID, op, "")
 		fields.Rejections = []eventlog.Rejection{{Stage: "circuit_" + scope}}
 		a.events.Emit("protocol.circuit_open", fields)
 		log.Printf("protocol: account id=%d %s circuit opened to stop repeating a rejected request", acc.ID, scope)
@@ -1518,6 +1671,32 @@ func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID
 	return a.pool.RecoverCodeSession(ctx, acc, appID, proxyValue, fallbackDirect, err, func(ctx context.Context) (string, error) {
 		return a.fetchAccountLoginBuffer(ctx, acc)
 	})
+}
+
+func (a *App) invokeH5Code(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
+	redirectURI, scope, state := h5CodeParams(payload)
+	if redirectURI == "" {
+		return nil, fmt.Errorf("h5 code requires redirect_uri (and optional scope, state) inside payload")
+	}
+	return a.pool.GetH5Code(ctx, acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, proxyValue, fallbackDirect, acc)
+}
+
+// h5CodeParams reads the official-account OAuth parameters scripts send in the
+// payload. Empty scope defaults to snsapi_base and an empty state is generated
+// inside the protocol layer.
+func h5CodeParams(payload map[string]any) (string, string, string) {
+	if payload == nil {
+		return "", "", ""
+	}
+	field := func(keys ...string) string {
+		for _, key := range keys {
+			if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	}
+	return field("redirect_uri", "redirect"), field("scope"), field("state")
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {

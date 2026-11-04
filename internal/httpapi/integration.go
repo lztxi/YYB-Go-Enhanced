@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"yyb_go/internal/eventlog"
 	"yyb_go/internal/proxysource"
 )
 
@@ -79,7 +80,11 @@ func (a *App) handleIntegrationAccounts(w http.ResponseWriter, r *http.Request) 
 		out = append(out, map[string]any{
 			"id": public.ID, "display_name": firstNonEmpty(deref(public.Remark), deref(public.Nickname), deref(public.Alias), "账号"),
 			"remark": deref(public.Remark), "status": deref(public.Status), "openid_masked": maskIntegrationValue(public.OpenID),
-			"updated_at": public.UpdatedAt,
+			// Scan channel the account was onboarded on (appstore/pcmgr/
+			// gameassist). Code fetching is channel-agnostic; scripts use this
+			// only to report or balance across channels.
+			"scan_product": public.ScanProduct,
+			"updated_at":   public.UpdatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out)})
@@ -165,8 +170,11 @@ func (a *App) handleIntegrationGetCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := a.invokeWXApp(r.Context(), account, strings.TrimSpace(body.AppID), nil, a.invokeGetCode)
+	result, err := a.invokeWXApp(withWXOperationContext(r.Context(), eventlog.OpGetCode), account, strings.TrimSpace(body.AppID), nil, a.invokeGetCode)
 	if err != nil {
+		if writeIfCircuitOpen(w, err) || writeIfAppIDDenied(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}

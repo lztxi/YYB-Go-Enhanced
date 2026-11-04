@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"yyb_go/internal/eventlog"
@@ -32,6 +33,18 @@ type Config struct {
 	// DeviceIdentity is DeviceIdentityStable (one device per account) or
 	// DeviceIdentityRandom (the historical new device per login/request).
 	DeviceIdentity string
+	// LoginBudget caps the OAuth-layer calls traffic may cause per account
+	// inside LoginWindow (see login_budget.go). Zero disables it, which is what
+	// DefaultConfig gives; the service passes DefaultLoginBudget and
+	// DefaultLoginWindow unless configured otherwise.
+	LoginBudget int
+	LoginWindow time.Duration
+	// FreshSessionWindow is the guard that treats a -14 within this long after a
+	// successful request as the AppID's own refusal and does not log in again
+	// (see code_recovery.go). Zero keeps DefaultFreshSessionWindow, so a Config
+	// that does not set it behaves as before; a negative value switches the guard
+	// off.
+	FreshSessionWindow time.Duration
 }
 
 func DefaultConfig() Config {
@@ -73,6 +86,13 @@ type Pool struct {
 	// two one-time login codes consumed at the same time.
 	codeLocks   map[int64]chan struct{}
 	codeRepairs map[string]codeRepairAttempt
+	// verified remembers the last successful request per account and route,
+	// so a -14 right after it is not mistaken for an expired session.
+	verified map[string]verifiedSession
+	// budget limits how often traffic may reach the OAuth layer per account.
+	budget *loginBudget
+	// freshWindow is the guard window in force, in nanoseconds; zero is off.
+	freshWindow atomic.Int64
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
@@ -107,15 +127,29 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	if cfg.DeviceIdentity == "" {
 		cfg.DeviceIdentity = def.DeviceIdentity
 	}
-	return &Pool{
+	p := &Pool{
 		cfg:          cfg,
 		db:           db,
 		locks:        map[string]chan struct{}{},
 		codeLocks:    map[int64]chan struct{}{},
 		codeRepairs:  map[string]codeRepairAttempt{},
+		verified:     map[string]verifiedSession{},
+		budget:       newLoginBudget(cfg.LoginBudget, cfg.LoginWindow),
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
 	}
+	p.freshWindow.Store(int64(EffectiveFreshWindow(cfg.FreshSessionWindow)))
+	return p
+}
+
+// ProviderOf returns the credential provider marker of an account. Appstore
+// accounts store none; pcmgr and gameassist carry their channel name.
+func ProviderOf(acc *store.WechatAccount) string {
+	if acc == nil {
+		return ""
+	}
+	provider, _ := acc.Credentials["provider"].(string)
+	return provider
 }
 
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
@@ -130,7 +164,13 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 
 func (p *Pool) getCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
 	call := func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		return p.requestLoginCode(ctx, st, appID)
+		result, err := p.requestLoginCode(ctx, st, appID)
+		if err == nil {
+			// A non-empty wx.login code is the only proof, tied to this very
+			// session and the cache route key it carries.
+			p.markSessionVerified(firstAccount(expected), accountID, st)
+		}
+		return result, err
 	}
 	if len(expected) > 0 && expected[0].SessionOnly() && !p.hasNativeRecovery(ctx, accountID, tcpProxy) {
 		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call, expected...)
