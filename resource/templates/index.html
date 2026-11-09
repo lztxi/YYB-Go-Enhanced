@@ -955,9 +955,9 @@
     }
   </style>
   <link rel="stylesheet" href="/static/css/scan-channel.css?v=049">
-  <link rel="stylesheet" href="/static/css/multi-channel.css?v=050">
-  <script src="/static/js/scan-channel.js?v=050"></script>
-  <script src="/static/js/fleet-ui.js?v=050"></script>
+  <link rel="stylesheet" href="/static/css/multi-channel.css?v=051">
+  <script src="/static/js/scan-channel.js?v=094"></script>
+  <script src="/static/js/fleet-ui.js?v=095"></script>
 </head>
 <body>
   <div class="app">
@@ -1064,6 +1064,15 @@
                 <strong id="accountProxyStatus">选择账号后读取配置</strong>
               </div>
               <a class="btn secondary" id="proxySettingsLink" href="/proxies">管理代理</a>
+            </div>
+            <div class="proxy-summary">
+              <div class="proxy-summary-copy">
+                <label for="accountCircuitEnabled"><input id="accountCircuitEnabled" type="checkbox" disabled aria-describedby="accountCircuitStatus"> 当前账号启用协议熔断</label>
+                <p class="field-note" id="accountCircuitStatus" role="status">选择账号后读取设置</p>
+                <span class="field-note">仅控制当前渠道账号。全局关闭时所有账号均不熔断，独立限速与黑名单不变。</span>
+                <a id="accountCircuitGlobalLink" href="/settings#circuitCard" hidden>管理全局总控</a>
+              </div>
+              <button class="btn secondary" id="saveAccountCircuit" type="button" disabled>保存账号熔断</button>
             </div>
             <div class="form-grid">
               <div class="field">
@@ -1228,10 +1237,14 @@
         <button class="link-dialog-close" id="accountLinkDialogClose" type="button" aria-label="关闭">×</button>
       </div>
       <form id="accountLinkConfigPane">
+        <div class="field">
+          <label><input id="accountLinkMulti" type="checkbox"> 开放多渠道授权</label>
+          <span class="field-note">允许同一微信逐个扫码，分别保存各渠道并归组。原账号 ID 保留，点击“完成授权”或到期后链接失效。</span>
+        </div>
         <div class="field" id="accountLinkProductField">
           <label for="accountLinkProduct">本次扫码渠道</label>
           <select class="input" id="accountLinkProduct"><option value="appstore">YYB</option><option value="pcmgr">PCMgr</option><option value="gameassist">GameAssist</option></select>
-          <span class="field-note">切换前会说明影响，扫码成功后保留原账号 ID。</span>
+          <span class="field-note" id="accountLinkProductNote">切换前会说明影响，扫码成功后保留原账号 ID。</span>
         </div>
         <div class="field">
           <label for="accountLinkTTL">链接有效期（分钟）</label>
@@ -1257,7 +1270,7 @@
           <a class="btn primary" id="accountLinkOpenBtn" href="#" target="_blank" rel="noopener">打开链接</a>
           <button class="btn secondary" id="accountLinkDoneBtn" type="button">完成</button>
         </div>
-        <p class="link-dialog-footnote">请勿公开转发或保存二维码。链接在有效期结束或成功授权后立即失效。</p>
+        <p class="link-dialog-footnote">请勿公开转发或保存二维码。单渠道成功后失效；多渠道需点击“完成授权”，也会按原有效期到期。</p>
       </section>
     </div>
   </dialog>
@@ -1389,6 +1402,7 @@
           if (element) element.hidden = !isAdmin;
         });
         $("qingLongSettings").hidden = !isAdmin;
+		$("accountCircuitGlobalLink").hidden = !isAdmin;
         document.querySelector(".account-maintenance").hidden = !isAdmin;
         $("panelAdminNote").hidden = isAdmin;
       } catch {
@@ -1454,7 +1468,12 @@
     function lifecycleMarkup(account) {
       if (account.status === "expired") return '<span class="account-lifecycle lifecycle-inactive">保活已停止 · 重新扫码后恢复</span>';
       if (account.status === "session_only") return '<span class="account-lifecycle lifecycle-inactive">授权已失效 · 仅尝试原会话，请重新扫码</span>';
+      if (account.scan_product === 'ldplayer' || account.scan_product === 'qbbrowser' && !account.credential_expires_at) return '<span class="account-lifecycle lifecycle-inactive">有效期未知 · 自动续期尚未验证，以实际取码结果为准</span>';
       const now = Math.floor(Date.now() / 1000);
+      if(account.scan_product==='qbbrowser'){
+        const due=Number(account.credential_expires_at),remaining=Math.max(0,due-now),interval=Number(account.credential_expires_in||due-now),ratio=interval>0?Math.min(1,remaining/interval):0;
+        return `<span class="account-lifecycle" aria-label="QQ 浏览器凭据有效期"><span class="lifecycle-row"><span class="lifecycle-label">访问凭据</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(ratio)};width:${(ratio*100).toFixed(1)}%"></span></span><span class="lifecycle-value">${remaining?lifecycleDuration(remaining):'待刷新'}</span></span><span class="lifecycle-note">按上游期限刷新 · 长期寿命待验证</span></span>`;
+      }
       if(account.scan_product==='pcmgr'){
 		const due=Number(account.credential_expires_at||0),remaining=Math.max(0,due-now),interval=Number(account.credential_expires_in||86400),ratio=Math.min(1,remaining/interval);
 		return `<span class="account-lifecycle" aria-label="PCMgr 续期计划"><span class="lifecycle-row" title="计划执行续期的时间，不代表服务端真实有效期"><span class="lifecycle-label">下次续期</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(ratio)};width:${(ratio*100).toFixed(1)}%"></span></span><span class="lifecycle-value">${due?remaining?lifecycleDuration(remaining):'待续期':'未记录'}</span></span><span class="lifecycle-note">PCMgr · 续期计划，非实际有效期</span></span>`;
@@ -1470,8 +1489,8 @@
       const scanClass = !observed || scanRemaining <= 0 ? "expired" : scanRemaining < 5 * 86400 ? "warn" : "scan";
       const autoClass = !expiresAt || autoRemaining <= 0 ? "expired" : autoRemaining < 15 * 60 ? "warn" : "";
       return `<span class="account-lifecycle" aria-label="账号有效期">
-        <span class="lifecycle-row ${autoClass}"><span class="lifecycle-label">保活凭据</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(autoRatio / 100)};width:${autoRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${expiresAt ? lifecycleDuration(autoRemaining) : "未记录"}</span></span>
-        <span class="lifecycle-row ${scanClass}"><span class="lifecycle-label">扫码 30天</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(scanRatio / 100)};width:${scanRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${observed ? lifecycleDuration(scanRemaining) : "未记录"}</span></span>
+        <span class="lifecycle-row ${autoClass}"><span class="lifecycle-label">${account.scan_product === 'gameassist' ? '刷新计划' : '保活凭据'}</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(autoRatio / 100)};width:${autoRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${expiresAt ? lifecycleDuration(autoRemaining) : "未记录"}</span></span>
+        <span class="lifecycle-row ${scanClass}" title="扫码后30天的重新授权提醒，不保证服务端在此期间持续可用"><span class="lifecycle-label">重扫提醒</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(scanRatio / 100)};width:${scanRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${observed ? lifecycleDuration(scanRemaining) : "未记录"}</span></span>
         <span class="lifecycle-note">${observed ? `扫码 ${formatChecked(observed)}` : "扫码时间未记录"}${account.credential_expires_at ? ` · 到期 ${formatChecked(account.credential_expires_at)}` : ""}</span>
       </span>`;
     }
@@ -1639,7 +1658,7 @@
               ${pendingConfirmation
                 ? `<button type="button" class="account-status account-status-toggle ${cls}" aria-expanded="false" aria-controls="confirm-account-${account.id}" aria-label="确认账号 ${escapeHTML(number)} 的状态"><span class="status-dot"></span>${status}<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>`
                 : `<span class="account-status ${cls}" title="${account.status === "session_only" ? "授权已拒绝，原会话可尝试使用，不代表保活恢复" : account.rescan_recommended ? "RefreshToken 已使用约 25 天，建议在失效前重新扫码" : ""}"><span class="status-dot"></span>${status}</span>`}
-              <span class="scan-channel-badge" title="扫码渠道：${scanChannelName(account.scan_product)}" aria-label="${scanChannelName(account.scan_product)} 渠道"><img alt="" src="/static/images/scan-${scanChannelBadge(account.scan_product)}.png"></span>
+              <span class="scan-channel-badge" title="扫码渠道：${scanChannelName(account.scan_product)}" aria-label="${scanChannelName(account.scan_product)} 渠道"><img alt="" src="/static/images/scan-${scanChannelBadge(account.scan_product)}.png?v=095"></span>
               </span>
             </span>
             <span class="account-meta" title="最后检查 ${formatChecked(account.last_checked_at)}">ID ${escapeHTML(number)} · ${escapeHTML(proxy)}${!isExpired && state.proxyConfigs.get(String(account.id))?.keepalive_supported === false ? " · 不可保活" : ""}</span>
@@ -1678,6 +1697,7 @@
     }
 
     async function loadAccountProxySummary() {
+      loadAccountCircuit();
       const account = getSelectedAccount();
       if (!account) {
         $("accountProxyStatus").textContent = "选择账号后读取配置";
@@ -1695,6 +1715,57 @@
         if (state.selectedOpenID === openid) $("accountProxyStatus").textContent = `读取失败：${error.message}`;
       }
     }
+
+    let circuitLoadSequence = 0;
+    let circuitSaving = false;
+    let circuitMasterEnabled = false;
+    async function loadAccountCircuit() {
+      const sequence = ++circuitLoadSequence;
+      const account = getSelectedAccount();
+      $("accountCircuitEnabled").disabled = true;
+      $("accountCircuitEnabled").checked = false;
+      $("saveAccountCircuit").disabled = true;
+      $("accountCircuitStatus").textContent = account ? "正在读取熔断设置" : "选择账号后读取设置";
+      if (!account) { $("accountCircuitEnabled").checked = false; return; }
+      try {
+        const data = await api("GET", `/accounts/circuit-settings?ref=${encodeURIComponent(account.id)}`);
+        if (sequence !== circuitLoadSequence) return;
+        circuitMasterEnabled = data.global_enabled;
+        $("accountCircuitEnabled").checked = data.effective;
+        $("accountCircuitStatus").textContent = !data.global_enabled ? `当前不生效：全局总控已关闭。账号原设置：${data.account_enabled ? "开启" : "关闭"}，总控开启后恢复。` : data.effective ? "当前生效：此账号启用熔断" : "当前生效：此账号已关闭熔断";
+        $("accountCircuitEnabled").disabled = circuitSaving || !data.global_enabled;
+        $("saveAccountCircuit").disabled = circuitSaving || !data.global_enabled;
+      } catch (error) {
+        if (sequence === circuitLoadSequence) $("accountCircuitStatus").textContent = `读取失败：${error.message}，请刷新重试`;
+      }
+    }
+    $("saveAccountCircuit").addEventListener("click", async () => {
+      const account = getSelectedAccount();
+      if (!account || circuitSaving || !circuitMasterEnabled) return;
+      const enabled = $("accountCircuitEnabled").checked;
+      circuitSaving = true;
+      $("accountCircuitEnabled").disabled = true;
+      $("saveAccountCircuit").disabled = true;
+      let saveError = "";
+      try {
+        await api("PUT", `/accounts/circuit-settings?ref=${encodeURIComponent(account.id)}`, {enabled});
+        setActivity(`账号 ID ${account.id} 熔断设置已保存`);
+      } catch (error) {
+        saveError = error.message;
+        setActivity(`保存熔断设置失败：${error.message}`);
+      } finally {
+        circuitSaving = false;
+        await loadAccountCircuit();
+        if (saveError && getSelectedAccount()?.id === account.id) $("accountCircuitStatus").textContent = `保存失败：${saveError}。当前选择已重新读取，请重试。`;
+      }
+    });
+
+    window.addEventListener("storage", event => {
+      if (event.key === "yyb-circuit-settings-changed" && !circuitSaving) loadAccountCircuit();
+    });
+    window.addEventListener("focus", () => {
+      if (!circuitSaving) loadAccountCircuit();
+    });
 
     function renderFeatures() {
       const select = $("featureSel");
@@ -1774,9 +1845,10 @@
       if (!endpoint) throw new Error("当前没有可调用能力。");
       if (feature?.requiresAppID !== false && !appID) throw new Error("请输入 APPID。");
       const isOAuth = endpoint === "oauth", isQRCodeAuth = endpoint === "qrcodeauth";
+      const protocolRef = account && endpoint !== "getUserInfo" && account.fleet_primary_id ? String(account.fleet_primary_id) : account?.openid;
       const body = isQRCodeAuth ? (account ? {product: account.scan_product || "appstore"} : undefined)
         : isOAuth ? {ref: String(account.id), appid: appID, redirect_uri: $("oauthRedirectInput").value.trim(), scope: $("oauthScopeInput").value, state: $("oauthStateInput").value.trim()}
-        : {ref: account.openid};
+        : {ref: protocolRef};
       if (!isOAuth && feature?.requiresAppID !== false) body.app_id = appID;
       if (isOAuth && !body.redirect_uri) throw new Error("请填写公众号回调地址。");
       if (feature?.needsPayload) {
@@ -1843,7 +1915,7 @@
         $("accountStrip").innerHTML = `<div class="empty-state">账号加载中</div>`;
       }
       try {
-        state.accounts = await api("GET", "/accounts");
+        state.accounts = await api("GET", "/accounts?include_members=1");
 		state.proxyConfigs.clear();
 		await Promise.all(state.accounts.map(async account => {
 		  try { state.proxyConfigs.set(String(account.id), await api("GET", `/accounts/proxy?ref=${encodeURIComponent(account.id)}`)); } catch { /* Selected account reports details. */ }
@@ -2079,6 +2151,9 @@
       pendingAccountLinkAccount = account;
       confirmedAccountLinkProduct = account.scan_product || "appstore";
       $("accountLinkProduct").value = confirmedAccountLinkProduct;
+      $("accountLinkMulti").checked = false;
+      $("accountLinkProduct").disabled = false;
+      $("accountLinkProductNote").textContent = "切换前会说明影响，扫码成功后保留原账号 ID。";
       $("accountLinkProductField").hidden = kind !== "update";
       $("accountLinkDialogTitle").textContent = kind === "update" ? "生成更新链接" : "生成新增链接";
       $("accountLinkDialogDescription").textContent = kind === "update"
@@ -2117,8 +2192,9 @@
       button.disabled = true;
       button.textContent = "正在生成";
       try {
-        const product = kind === "update" ? $("accountLinkProduct").value : "";
-        const result = await api("POST", "/api/account-links", { kind, ref: String(account.id), ttl_seconds: minutes * 60, product, confirm_switch:kind === "update" && product !== (account.scan_product || "appstore") && product === confirmedAccountLinkProduct });
+        const multi = $("accountLinkMulti").checked;
+        const product = kind === "update" ? (multi ? account.scan_product || "appstore" : $("accountLinkProduct").value) : "";
+        const result = await api("POST", "/api/account-links", { kind, ref: String(account.id), ttl_seconds: minutes * 60, product, allow_multi_channel:multi, confirm_switch:!multi && kind === "update" && product !== (account.scan_product || "appstore") && product === confirmedAccountLinkProduct });
         const shareText = accountLinkShareText(kind, account, result.url);
         let copied = true;
         try { await copyText(shareText, $("accountLinkURL")); } catch { copied = false; }
@@ -2132,7 +2208,7 @@
         $("accountLinkResultPane").hidden = false;
         $("accountLinkURL").value = shareText;
         $("accountLinkOpenBtn").href = result.url;
-        $("accountLinkExpiry").textContent = `有效期至 ${new Date(result.expires_at * 1000).toLocaleString()}。成功授权后链接立即失效。`;
+        $("accountLinkExpiry").textContent = `有效期至 ${new Date(result.expires_at * 1000).toLocaleString()}。${result.allow_multi_channel ? '已开放多渠道，授权人点击“完成授权”后链接失效。' : '成功授权后链接立即失效。'}`;
         renderExistingAccountLinks(result.existing || []);
         requestAnimationFrame(() => $("accountLinkCopyBtn").focus());
       } catch (error) {
@@ -2161,7 +2237,7 @@
       $("accountLinkExistingSummary").textContent = blocked
         ? `已拦截：该账号已有 ${items.length} 条未消费链接。使用现有链接，或作废后再生成。`
         : `该账号已有 ${items.length} 条未消费链接。`;
-      $("accountLinkExistingList").innerHTML = items.map(item => `<div class="link-dialog-existing-row"><span>链接 ${item.id}${item.product ? ` · ${scanChannelName(item.product)}` : ''} · 有效期至 ${new Date(item.expires_at * 1000).toLocaleString()}</span><span class="inline-actions"><button class="btn secondary" type="button" data-existing-copy="${item.id}">复制</button><a class="btn secondary" href="${item.url || '#'}" target="_blank" rel="noopener">打开</a><button class="btn secondary" type="button" data-existing-revoke="${item.id}">作废</button></span></div>`).join("");
+      $("accountLinkExistingList").innerHTML = items.map(item => `<div class="link-dialog-existing-row"><span>链接 ${item.id}${item.allow_multi_channel ? ' · 多渠道' : item.product ? ` · ${scanChannelName(item.product)}` : ''} · 有效期至 ${new Date(item.expires_at * 1000).toLocaleString()}</span><span class="inline-actions"><button class="btn secondary" type="button" data-existing-copy="${item.id}">复制</button><a class="btn secondary" href="${item.url || '#'}" target="_blank" rel="noopener">打开</a><button class="btn secondary" type="button" data-existing-revoke="${item.id}">作废</button></span></div>`).join("");
       const account = pendingAccountLinkAccount;
       $("accountLinkExistingList").querySelectorAll("[data-existing-copy]").forEach(button => button.onclick = async () => { const item = items.find(entry => String(entry.id) === button.dataset.existingCopy); if (!item?.url) return; try { await copyText(accountLinkShareText(item.kind || pendingAccountLinkKind, account, item.url)); button.textContent = "已复制"; setTimeout(() => { button.textContent = "复制"; }, 1600); } catch { setActivity("分享内容已选中，请按 Ctrl+C"); } });
       $("accountLinkExistingList").querySelectorAll("[data-existing-revoke]").forEach(button => button.onclick = async () => {
@@ -2353,6 +2429,12 @@
     $("updateAccountLinkBtn").addEventListener("click", () => openAccountLinkDialog("update"));
     $("addAccountLinkBtn").addEventListener("click", () => openAccountLinkDialog("add"));
     $("accountLinkConfigPane").addEventListener("submit", event => { event.preventDefault(); createAccountLink(); });
+    $("accountLinkMulti").addEventListener("change", () => {
+      $("accountLinkProduct").disabled = $("accountLinkMulti").checked;
+      $("accountLinkProductNote").textContent = $("accountLinkMulti").checked
+        ? "多渠道分别保存并归组，保留原账号渠道和 ID。"
+        : "切换前会说明影响，扫码成功后保留原账号 ID。";
+    });
     $("accountLinkProduct").addEventListener("change", async () => {
       const account = pendingAccountLinkAccount;
       if (!account) return;

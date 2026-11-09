@@ -63,6 +63,7 @@ type WmpfSession struct {
 	Session          AppSession
 	AutoAuth         autoAuthState
 	PSK              pskEntry
+	RefreshPSK       pskEntry
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
 	TCPProxy         string
@@ -142,14 +143,13 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	return p
 }
 
-// ProviderOf returns the credential provider marker of an account. Appstore
-// accounts store none; pcmgr and gameassist carry their channel name.
+// ProviderOf keeps routing consistent with the saved channel identity, including
+// historical namespaced records whose credentials were wiped. YYB uses "".
 func ProviderOf(acc *store.WechatAccount) string {
-	if acc == nil {
+	if acc == nil || acc.ScanProduct() == "appstore" {
 		return ""
 	}
-	provider, _ := acc.Credentials["provider"].(string)
-	return provider
+	return acc.ScanProduct()
 }
 
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
@@ -257,6 +257,16 @@ func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string)
 	return p.db.InvalidateSession(ctx, accountID, tcpProxy)
 }
 
+// PrepareSession consumes a newly confirmed scan ticket while it is fresh and
+// persists the protocol state. It requests no application code and makes no
+// claim about the server accepting future business calls or long-term renewal.
+func (p *Pool) PrepareSession(ctx context.Context, acc *store.WechatAccount, proxy string, fallback bool) error {
+	_, err := p.run(ctx, acc.LoginBuffer, acc.ID, proxy, fallback, func(context.Context, WmpfSession) (map[string]any, error) {
+		return nil, nil
+	}, acc)
+	return err
+}
+
 func (p *Pool) invalidateExpected(ctx context.Context, accountID int64, proxy string, expected ...*store.WechatAccount) error {
 	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, proxy))
 	if err := acquire(ctx, lock); err != nil {
@@ -290,7 +300,7 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	if err == nil {
 		st.FallbackDirect = fallbackDirect
 		res, err := op(ctx, st)
-		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || st.CachedOnly {
+		if err == nil || tcpProxy == "" || !fallbackDirect || IsApplicationRequestRejection(err) || IsBusinessResponseRejection(err) || errors.Is(err, ErrLoginCodeMalformed) || st.CachedOnly {
 			return res, err
 		}
 		_ = p.invalidateExpected(ctx, accountID, tcpProxy, expected...)
@@ -557,7 +567,7 @@ func (p *Pool) loginTarget(ctx context.Context, target Target, loginBuffer, tcpP
 		return WmpfSession{}, fmt.Errorf("login finished but no access PSK was issued")
 	}
 	return WmpfSession{
-		Session: appSess, AutoAuth: autoAuth, PSK: psk, CreatedAt: time.Now(),
+		Session: appSess, AutoAuth: autoAuth, PSK: psk, RefreshPSK: pickRefreshPSK(psks), CreatedAt: time.Now(),
 		TCPProxy: tcpProxy, FallbackDirect: fallbackDirect, Device: device,
 	}, nil
 }
@@ -596,7 +606,7 @@ func sessionExpiresAt(st WmpfSession, ttl time.Duration) int64 {
 }
 
 func (st WmpfSession) toBlob() map[string]any {
-	return map[string]any{
+	blob := map[string]any{
 		"session": map[string]any{
 			"send_key":   encBytes(st.Session.SendKey),
 			"recv_key":   encBytes(st.Session.RecvKey),
@@ -614,6 +624,10 @@ func (st WmpfSession) toBlob() map[string]any {
 		"shortlink_targets": targetsToAny(st.ShortlinkTargets),
 		"tcp_proxy":         st.TCPProxy,
 	}
+	if st.RefreshPSK.PSKType == 2 {
+		blob["refresh_psk_entry"] = st.RefreshPSK
+	}
+	return blob
 }
 
 func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
@@ -649,6 +663,13 @@ func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
 	if am, ok := blob["native_autoauth"].(map[string]any); ok {
 		st.AutoAuth = autoAuthState{Device: decBytes(am["device"]), Key: decBytes(am["key"]),
 			EncKey: decBytes(am["enc_key"]), AttemptedAt: int64FromAny(am["attempted_at"])}
+	}
+	if rm, ok := blob["refresh_psk_entry"].(map[string]any); ok {
+		st.RefreshPSK = pskEntry{
+			PSKType:      int(int64FromAny(rm["psk_type"])),
+			PreSharedKey: stringAny(rm["pre_shared_key"]), TicketEntry: stringAny(rm["ticket_entry"]),
+			Lifetime: int64FromAny(rm["lifetime"]), ExpiredAt: int64FromAny(rm["expired_at"]),
+		}
 	}
 	if len(st.ShortlinkTargets) == 0 {
 		st.ShortlinkTargets = append([]Target(nil), shortlinkFallbackTargets...)

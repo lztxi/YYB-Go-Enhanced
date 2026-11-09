@@ -23,8 +23,10 @@ import (
 	"time"
 
 	"yyb_go/internal/gameassist"
+	"yyb_go/internal/ldplayer"
 	"yyb_go/internal/pcmgr"
 	"yyb_go/internal/protocol"
+	"yyb_go/internal/qbbrowser"
 )
 
 const (
@@ -66,6 +68,7 @@ type Session struct {
 	LoginBuffer   string
 	Status        string
 	Error         string
+	authError     error
 	mu            sync.Mutex
 }
 
@@ -135,6 +138,30 @@ func OAuthURL(product string) (string, error) {
 		return oauthURL, nil
 	case "pcmgr":
 		return "https://open.weixin.qq.com/connect/qrconnect?" + url.Values{"appid": {pcmgr.HostAppID}, "redirect_uri": {"https://security.guanjia.qq.com/login"}, "response_type": {"code"}, "scope": {"snsapi_login,snsapi_runtime_pcsdk"}, "state": {"233"}, "self_redirect": {"true"}}.Encode(), nil
+	case "qbbrowser":
+		state, err := randomHex(16)
+		if err != nil {
+			return "", err
+		}
+		return "https://open.weixin.qq.com/connect/qrconnect?" + url.Values{
+			"appid":         {qbbrowser.HostAppID},
+			"redirect_uri":  {"https://go.browser.qq.com/wx-login.html"},
+			"response_type": {"code"},
+			"scope":         {"snsapi_login,snsapi_runtime_pcsdk"},
+			"state":         {state},
+			"self_redirect": {"true"},
+		}.Encode(), nil
+	case "ldplayer":
+		// 雷电游戏中心的 OAuth 入口：标准 WeChat qrconnect 但 appid 和
+		// redirect 指向雷电，scope 与其它 runtime_pcsdk 渠道一致。
+		return "https://open.weixin.qq.com/connect/qrconnect?" + url.Values{
+			"appid":         {ldplayer.OAuthAppID},
+			"redirect_uri":  {ldplayer.OAuthRedirectURI},
+			"response_type": {"code"},
+			"scope":         {ldplayer.OAuthScope},
+			"state":         {"ldplayer"},
+			"self_redirect": {"true"},
+		}.Encode(), nil
 	case "gameassist":
 		// GameAssist.exe fast-login page (GameAssist.log): its own open-platform
 		// appid redirecting into the syzslogin callback on the shared gateway.
@@ -319,19 +346,71 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 		sess.Status = "confirmed"
 		return protocol.LoginBufferResult{LoginBuffer: buffer, Credentials: *sess.Credentials}, nil
 	}
+	if sess.Product == "qbbrowser" {
+		if sess.Credentials == nil {
+			if sess.authError != nil {
+				return protocol.LoginBufferResult{}, sess.authError
+			}
+			result, err := qbbrowser.ExchangeCode(ctx, sess.HTTPClient, sess.AuthorizeCode)
+			if err != nil {
+				// OAuth codes are single-use. Even a lost reply may have consumed
+				// the code; repeated UI confirms must not send it again.
+				sess.authError = err
+				return protocol.LoginBufferResult{}, err
+			}
+			expiresAt := int64(0)
+			if result.ExpiresIn > 0 {
+				expiresAt = time.Now().Unix() + result.ExpiresIn
+			}
+			sess.Credentials = &protocol.LoginBufferCredentials{
+				Provider: "qbbrowser", QBBrowser: result.Credentials, OpenID: result.Credentials.Identity(),
+				AccessToken: result.Credentials.QBAccessToken, RefreshToken: result.Credentials.WXRefreshToken,
+				ExpiresIn: result.ExpiresIn, ExpiresAt: expiresAt, ExpirySource: "upstream", LoginType: "WX",
+				RefreshTokenObservedAt: time.Now().Unix(),
+			}
+		}
+		buffer, err := c.loginBuffers.FetchLoginBuffer(ctx, *sess.Credentials)
+		if err != nil {
+			return protocol.LoginBufferResult{}, err
+		}
+		sess.LoginBuffer, sess.Status = buffer, "confirmed"
+		return protocol.LoginBufferResult{LoginBuffer: buffer, Credentials: *sess.Credentials}, nil
+	}
+	if sess.Product == "ldplayer" {
+		// 雷电渠道：OAuth code 直接换 buffer，没有中间凭据层。
+		// buffer 即 LoginBuffer——后续 ilink 栈自动消费。
+		if sess.LoginBuffer == "" {
+			buffer, err := ldplayer.FetchBuffer(ctx, sess.HTTPClient, sess.AuthorizeCode)
+			if err != nil {
+				return protocol.LoginBufferResult{}, err
+			}
+			sess.LoginBuffer = buffer
+			// 最小凭据：仅标记渠道，buffer 存在 acc.LoginBuffer。
+			openid, idErr := ldplayer.BufferIdentity(buffer)
+			if idErr != nil {
+				return protocol.LoginBufferResult{}, idErr
+			}
+			sess.Credentials = &protocol.LoginBufferCredentials{
+				Provider: "ldplayer", OpenID: openid, LoginType: "WX",
+				RefreshTokenObservedAt: time.Now().Unix(),
+			}
+		}
+		buffer := sess.LoginBuffer
+		sess.Status = "confirmed"
+		return protocol.LoginBufferResult{LoginBuffer: buffer, Credentials: *sess.Credentials}, nil
+	}
 	if sess.Product == "gameassist" {
 		if sess.Credentials == nil {
 			ga, err := gameassist.ExchangeCode(ctx, sess.HTTPClient, sess.AuthorizeCode, sess.State)
 			if err != nil {
 				return protocol.LoginBufferResult{}, err
 			}
-			// RefreshBusinessID stays empty: refresh follows the default pc_yyb
-			// main route with the -109 check-login fallback, like appstore QR
-			// credentials, until the syzs gateway proves otherwise.
+			// The provider routes later refresh/check-login to syzslogin.
 			sess.Credentials = &protocol.LoginBufferCredentials{
 				Provider: "gameassist", OpenID: ga.OpenID, AccessToken: ga.AccessToken, RefreshToken: ga.RefreshToken,
 				LoginType: defaultString(ga.LoginType, "WX"), Nickname: ga.Nickname,
 				ExpiresAt: ga.ExpiresAt, ExpiresIn: ga.ExpiresIn, RefreshTokenObservedAt: time.Now().Unix(),
+				ExpirySource: ga.ExpirySource,
 			}
 		}
 		buffer, err := c.loginBuffers.FetchLoginBuffer(ctx, *sess.Credentials)
@@ -373,6 +452,10 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 }
 
 func (c *Client) GetLoginBufferFromCode(ctx context.Context, code string) (protocol.LoginBufferResult, error) {
+	return c.GetLoginBufferFromCodeForProduct(ctx, code, "appstore")
+}
+
+func (c *Client) GetLoginBufferFromCodeForProduct(ctx context.Context, code, product string) (protocol.LoginBufferResult, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return protocol.LoginBufferResult{}, fmt.Errorf("authorize code is empty")
@@ -382,6 +465,7 @@ func (c *Client) GetLoginBufferFromCode(ctx context.Context, code string) (proto
 		return protocol.LoginBufferResult{}, err
 	}
 	sess := &Session{
+		Product:       product,
 		HTTPClient:    &http.Client{Timeout: c.timeout, Jar: jar, Transport: c.transport},
 		Jar:           jar,
 		AuthorizeCode: code,

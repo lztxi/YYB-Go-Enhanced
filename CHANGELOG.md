@@ -2,6 +2,60 @@
 
 本项目按实际提交时间记录主要功能变化，便于部署后确认版本内容。
 
+## v0.3.0 - 2026-11-08
+
+- 已有账号补扫统一使用锚定原主账号的多渠道更新链接；授权、归组、代理继承和进度一起提交，失败不降级新增独立账号。QQ／雷电无法跨渠道自动核验时，可明确确认同一微信后继续，无需重新扫码；同渠道冲突仍拒绝。失效雷电成员经确认可重扫复用原成员 ID、备注和配置。
+- `/accounts`、集成账号列表默认固定返回主 ID 和身份，status 汇总组内最佳状态；管理参数 `include_members=1` 返回各渠道真实状态。协议接口只接受主账号引用，成员 ID/OpenID 直调返回 HTTP 409 和 `data.primary_ref`。主 ID 内部的多渠道调度、故障转移和并发分担保留；旧脚本若直接使用子 ID，需改用主 ID。
+- 多渠道 LRU 改用进程内递增顺序并在锁内排序，避免系统时钟相同／回拨及并发读取变化影响轮换。
+- 修复熔断总控与账号开关不同步：总控关闭时账号取消勾选并禁用，保留原偏好；总控开启后恢复。保存通知其他标签页，返回页面时重读，失败保持禁用。
+- #155：控制台 HTML、扫码页及缺失模板回退统一 `Cache-Control: no-store`，避免升级后继续缓存旧入口；静态资源仍可独立缓存。已经缓存的旧 HTML 需首次强制刷新才取得新响应头。
+- 雷电确认扫码后立即用新票据建立并持久化协议会话，不等第一笔业务。失败明确保存 unknown/expired，不重放拒绝票据，不自动同步未就绪授权。**这修复首次建会话时机，雷电长期恢复尚未完成，也尚缺新扫码真实验收。**
+- `wx.login` 解密后明确业务拒绝不再吞成空 code，按固定响应路径保留数值状态和阶段；损坏响应单独报错。业务拒绝不强刷、重建、跨账号重放或学习全局封禁；H5 也补业务阶段诊断。#136 的 `-12028` 服务端原因仍待确认。
+- 包含 v0.2.92 已修复的 UIN JSON 大整数精度问题（#147，关联 #145/#142）。回归覆盖数据库重开、缓存和请求身份一致；不把短期成功、同 token、本地期限或 renewed 日志当作长期保活证明。详见 [v0.3.0 收敛与验收](docs/v0300-account-channel-convergence.md)。
+
+## v0.2.96 - 2026-11-08
+
+- 修复多渠道账号里“莫名多出一个失效 YYB”的渠道识别错误：雷电、QQ 浏览器等授权失效后，旧清理逻辑会删除渠道标记，页面默认把原记录显示成 YYB。现在清理拒绝凭据时保留所有已支持渠道的非敏感标记；历史已清空的雷电、QQ 浏览器和电脑管家记录可根据既有身份前缀恢复识别，无需重扫或改库。
+- 账号列表、协议路由与新事件日志共用渠道识别；补上日志中雷电／QQ 浏览器渠道白名单。保留原账号 ID、归组和失效状态，不删除历史授权、不恢复已拒绝票据、不把显示修复当作保活恢复。详见[失效授权渠道识别修复](docs/expired-channel-identity-20261108.md)。
+
+## v0.2.95 - 2026-11-08
+
+- #149：个人设置新增「协议熔断总控」，首页「调用配置」新增当前渠道账号的熔断开关。总控关闭覆盖所有账号；开启时仅为启用的账号执行熔断。保存后下次请求生效，SQLite 持久化，升级及重启保留；修改开关清除对应冷却计数。未保存总控时沿用 `YYB_CIRCUIT_BREAKER`，默认开启。
+- 管理员管理总控，用户只能管理自己可见账号；账号设置随删除清理、ID 压缩迁移，合并授权保留目标配置。关闭熔断不会停用独立限速、黑名单、登录预算或授权拒绝处理，也不会修复上游 `-14` 或恢复已撤销凭据。
+- 修正腾讯手游助手图标：原素材误用了蓝色回收站，替换为官方 `GameAssistant.exe` 6.10.7110.578 内的红色图标，更新首页、渠道组与多渠道扫码的缓存版本。
+- 手游助手寿命复核：两份账号在建档约 70 小时后仍有业务取码成功，日志含按需恢复；另一份今天已重扫，不能用旧建档时间当连续授权寿命。现有证据不支持统一 24 小时上限，也不证明全部长期续期已解决。`syzs -109`、上游应用层 `-14` 和本地熔断分别记录，Refresh PSK 恢复握手仍未实现。
+- 复核 #138 及公开对照仓库：渠道 2 的现有扫码入口仍受 scope/session 创建限制；渠道 5 仍缺宿主签发票据的完整流程。两者保持研究状态，不添加不可用扫码入口。详见[本轮控制与渠道复核](docs/circuit-channel-review-20261108.md)。
+
+## v0.2.94 - 2026-11-08
+
+- QQ 浏览器渠道改为服务端独立扫码：微信授权 → 原生 PBProxy `WXAuth` → 小游戏票据 → 共享协议取码，无需安装 QQ 浏览器、扩展或手动推送。单渠道、多渠道及公共授权链接均接入，保存原生 `unionid` 供原有身份核验使用。
+- 定位普通浏览器登录能成功、小游戏换票却报 `10002` 的差异：只申请 `snsapi_login` 的独立授权失败，补上 `snsapi_runtime_pcsdk` 后真实换票和取码成功。旧浏览器凭据省略设备参数仍可换票，新普通权限凭据补真实设备参数仍失败；不再把缺 GUID 当作独立扫码的必填条件，也不编造机器标识。
+- 实现微信社会凭据的原生 `RefreshToken`，保存 refresh token 和上游访问期限，接入现有后台调度及 SQLite 持久化。与 QB 账号 token 区分；旧扩展导入的 ctk 没有 refresh token，仍显示期限未知、不伪刷新，需重新独立扫码才能获得新链。已独立扫码的账号拒绝旧扩展覆盖，防止后台推送抹掉刷新凭据。
+- 隔离真实账号验收：独立扫码后、原生刷新后、服务重启后分别一次取码，均 HTTP 200／32 位 code；原生刷新返回成功及上游 7200 秒，刷新后换票成功。token 本次未变，以上只证明短期链路及持久化可用，**尚未验证跨真实到期、数日或 30 天保活**。
+- QQ 桌面微信快捷授权接入同一服务器交换，绑定渠道与随机 state，拒绝重复消费。已通过合成回归，**桌面微信真实快捷确认尚未验收**；不把普通扫码成功写成快登已验证。雷电、手游助手及渠道 2/5 的未完成项保持原有边界。详见[QQ 独立授权验收](docs/qbbrowser-standalone-auth-20261108.md)。
+
+## QQ 浏览器扩展 1.2.0 - 2026-11-08
+
+- 修复“已登录但缺少机器标识”：真实官方浏览器确认第三方扩展页同步接口返回空、异步接口未开放，改由临时后台官方小游戏页读取原生设备参数，完成后关闭。`environment.getMachineGuid` 实测不是同一种标识，不冒充设备值。
+- 修复“立即推送没有反应”：显示扩展版本、即时进度和最终结果，禁重复提交，处理存储／后台失败及设备页、网络、响应体超时。周期推送使用设备缓存，ctk 不落扩展存储，凭据不进入官方网页。
+- 真实独立 QQ 浏览器设备读取和标签清理已通过，虚构账号回归覆盖推送与错误；用户真实换票、取码、长期恢复尚未验收。此为独立扩展更新，兼容服务端 v0.2.93，飞牛无需重启。见[扩展使用说明](extensions/qbbrowser-token/README.md)。
+
+## v0.2.93 - 2026-11-08
+
+- 雷电、QQ 浏览器改用官方安装包提取的图标，替换错误素材。
+- QQ 桥接按官方“文件工具”修正：读取微信模式的 `ctk`，使用原生机器 ID、可空 GUID 和设备请求头；补 `chrome.qbExternal` 异步接口。不用 openid 或随机 GUID 代替机器 ID。同电脑不同浏览器账号不再仅凭机器标识互相覆盖。单渠道／多渠道页均显示桥接入口和实验状态。
+- **QQ 独立扫码及电脑微信快速授权的服务器交换尚未接通，真实桥接全流程也尚未验收。** 本轮用户手动扫码后被旧设备检查拦截，修正通过合成测试，仍需实际推送、换票和取码验收。更正 v0.2.87–0.2.91 关于完整一键登录的过度表述；“换票已保存”不代表已取码或长期恢复成功。
+- 删除 QQ／雷电本地增加一天／七天的假续期：后台不再因此记 `renewed` 或写回 alive，手动刷新明确返回不支持，界面显示有效期未知。雷电票据明确返回 `-10` 后停止重放；有独立会话时保留 `session_only`。换票仍返回同张已拒绝票据时不再登录第二遍。
+- 修复手游助手回调期限读取：JSON 已含 token 时也读取 cookie 的期限，完全缺失时改用两小时刷新计划。保留明确已过期时间，记录期限来源；历史无来源标记的 30 天值按原发放时刻修正调度。既有 `syzs -109` 拒绝样本，也有超过 64 小时仍取码成功的样本，不能据此宣称全部保活已解决。
+- 保存服务器 type 2 Refresh PSK，数据库重载不丢失，与 Access PSK 分开。**本次只完成保存，尚未实现 Refresh PSK 长连接恢复握手。** 渠道 2/5 保持研究状态。
+- 验证与升级边界见[渠道登录与持久化复核](docs/channel-login-persistence-20261108.md)。
+
+## v0.2.92 - 2026-11-08
+
+- 修复会话缓存 JSON 读取时把 UIN 转成 `float64`、丢失大整数精度的问题（#147，关联 #145/#142）。首次登录使用正确的 `int64`，后续从数据库读取却可能变成另一个 UIN，影响取码、手机号和 `operateWxData`/encryptkey 请求。现在使用 `json.Number` 保留原始整数；实验室及显式审计入口的会话读取也同步修复。
+- 新增真实临时 SQLite 数据库回归测试，覆盖整数边界、缓存重载、数据库重开、原生会话 CAS 更新，以及首次登录与缓存请求的身份字段一致性。完整 Go 测试、`go vet` 和实验室相关测试通过；没有用真实账号批量探测。
+- 此修复针对已复现的本地身份损坏，尚待 issue 报告者验收，不代表所有 `-14`、#136 的 `-12028` 或长期保活问题已经解决。保护窗口与重试默认值保持现状；升级恢复条件和旧版对照限制见[会话 UIN 精度修复说明](docs/session-uin-precision-20261108.md)。
+
 ## v0.2.79 - 2026-11-05
 
 - **多渠道账号有了界面：一次扫多个渠道、卡片显示全部渠道、已有的几个 ID 可以合并。** v0.2.76 的编队只能用接口绑定，界面上看不到，同一个微信扫出的几个 ID 也只能各占一张卡片。现在：① 扫码页的“多渠道扫码”开关打开后，每个渠道（YYB / PCMgr / GameAssist）各出一个二维码，用同一个微信依次扫，扫完自动合并成一个账号，第一个扫到的是主账号；渠道清单取自服务端（`GET /api/scan-channels`），以后新增渠道，二维码、卡片和设置页的渠道选择会自己出现；② 账号卡片和“调用配置”里的“多渠道扫码”按钮给已有账号补扫缺的渠道、重扫失效的渠道（`/scan?ref=<ID>`）；③ 多渠道账号只占一张卡片：每个渠道一个图标和状态点（绿 / 红 / 黄），“2/3 可用”汇总，需要处理的渠道直接写在卡片上，展开后每个渠道一行（ID、状态、有效期、更新、代理、移出），也可以整体拆分；④ 账号区新增“合并渠道”：把已经分开的几个 ID 合并成一个多渠道账号，昵称相同、渠道不同的预先勾选，合并前核对 unionid，不一致的账号被拒绝，确认是同一个微信才能强制合并。它和“合并账号”不同：不删除任何账号，随时可以拆分。
@@ -9,6 +63,64 @@
 - **新增接口：** `GET /api/scan-channels`、`POST /api/fleet/bind-many`（一个主账号加多个成员，逐个返回结果）、`POST /api/fleet/dissolve`（拆分）；`POST /qr` 接受查询参数 `panel_sync=defer`。单个绑定也改为检查账号归属：两个归属不同的账号不能编在一起（此前接口不检查）。
 - **修复两处编队 ID 维护错误：** ① “压缩账号 ID”只改账号自己的 ID，编队指针没有跟着改，压缩后成员会指向别的账号；② 删除编队的主账号或成员后，剩下的成员仍指向已经不存在、或之后被复用的 ID。现在压缩同步改指针；删除主账号时剩余成员交给 ID 最小的成员，只剩一个账号的编队自动解散。
 - 验证：新增 Go 测试覆盖批量合并与拆分、归属检查、unionid 不一致与缺失、压缩和删除时的编队指针、面板只列主账号（含延后同步）、渠道清单与前端内置副本一致；新增浏览器测试 `tests/multi-channel-ui.cjs`（扫码页、卡片、合并与拆分、补扫、新增渠道、手机宽度），用虚构的二维码和账号，不触达上游。**还没做的：** 用真实微信把三个渠道完整扫一遍（二维码和确认由手机完成）；上线后请在实验实例上先扫一次。详见[多渠道账号](docs/console-features.md#多渠道账号一个微信多个渠道)。
+
+## v0.2.91 - 2026-11-07
+
+- **QQ 浏览器渠道扫码页改为扩展安装指引：** 之前选 QQ 渠道后仍尝试生成二维码或一键登录（跨域不可行），现在正确显示伴生扩展的安装步骤。QQ 浏览器渠道的建号方式是：在 QQ 浏览器里安装  扩展 → 扩展自动推 token → 服务端建号。扩展是唯一能访问 QQ 浏览器内部登录态的方式（token 不落盘、不跨域）。
+
+## v0.2.90 - 2026-11-07
+
+- **QQ 浏览器渠道扫码页正确路由到一键登录：** 服务端 /qr 拒绝 qbbrowser 的 QR 会话创建（返回 400 + 明确提示），客户端 newQR() 守卫路由到一键登录桥。之前的问题是服务端仍尝试生成 QR 并解析 UUID（必然失败）。
+
+## v0.2.89 - 2026-11-07
+
+- **修复 QQ 浏览器渠道触发 QR 扫码流程：** 选 QQ 浏览器渠道后扫码页仍调用 newQR() 生成二维码并解析 UUID，而 QQ 渠道不走 QR 流程（一键登录桥）——导致 "failed to parse WeChat QR uuid"。newQR 入口加渠道守卫：qbbrowser 时路由到一键登录桥而非 QR 生成。
+
+## v0.2.88 - 2026-11-07
+
+- **修复雷电渠道身份碰撞：** OpenID 从 device_id 派生改为 ticket SHA-256 哈希——同一雷电安装的不同微信扫码产生不同身份，不再互相覆盖或编队绑定冲突。每次重扫 = 新 ticket = 新账号（设计如此：旧行为是同 device_id 覆盖同一账号导致编队冲突）。
+
+## v0.2.87 - 2026-11-07
+
+- **QQ 浏览器渠道免扩展一键登录：** 扫码页选择 QQ 渠道后，页面 JS 自动检测 QQ 浏览器注入的登录桥（ / ），读取外层 access_token 并 POST 到  建号——**无需装扩展、无需扫码**。扩展仍是备选方案（适合批量/定时推送），但日常操作只需在 QQ 浏览器里打开面板即可。渠道注册表（）、扫码页、设置页、链接页、账号卡片同步加入 qbbrowser 渠道与徽标。
+
+## v0.2.86 - 2026-11-07
+
+- **雷电/手游助手渠道 badge 替换为官方 logo：** 从本机安装的雷电模拟器（ 400x400）和手游助手（ 48x48）提取官方图标，替换之前的手绘占位图。缓存版本号升级。
+- **雷电渠道有效期从 24 小时调整为 7 天：** 24 小时是初版实现的硬编码占位值——上游不返回过期时间，实际寿命由上游撤销决定（PR #144 实测最短约 20 分钟，但那是实验条件下）。7 天是更合理的 UI 展示占位值，保活仍只滑窗（每 2 分钟无实际刷新），真实存活由 get_code 结果暴露。编队会在成员死时自动转移。
+
+## v0.2.85 - 2026-11-07
+
+- **修复雷电渠道扫码保存失败（openid is required）：** 雷电 buffer 只含 ticket/device_id/host_appid，没有 openid——扫码流程的 UpsertAccount 拿到空 OpenID 直接拒绝。现在从 buffer 的 device_id（field 2）派生稳定身份  作为 OpenID（同一雷电安装 → 同一 device_id → 同一账号），与其他渠道的 Identity() 模式一致。
+
+## v0.2.84 - 2026-11-07
+
+- **新增雷电模拟器渠道 `ldplayer`（实验）：** 第五条客户端凭据链。雷电 14 游戏中心的微信小游戏走标准 WeChat qrconnect（appid `wx56135c126042c9e7`，scope `snsapi_login,snsapi_runtime_pcsdk`，回调 `ldmnq.com`），扫码后 OAuth code → `POST game-service.ldmnq.com/mini-game/wechat/login` 换 ilink login_buffer → 共享 ilink 栈取码（PR #144 首次 wx.login 已真机验证）。已知边界：**没有 refresh 接口**——buffer 是单发的，上游撤销或过期后需重扫；**没有 unionid**——同微信多次授权无法自动绑定为同一账号；**没有 AutoAuth 恢复**——keepalive 对它只做存活标记不做刷新。取消 lab-only 限制，正式进扫码页/链接/设置/编队。更多细节见 docs/ldplayer-channel-audit-20261105.md。
+
+## v0.2.83 - 2026-11-07
+
+- **取码黑白名单进面板（管理员）：** 此前内置拦截项、env 的 YYB_CODE_DENY/ALLOW_APPIDS、动态学习名单都只能在服务端配置或 curl 查看。现在「个人设置 → 取码黑白名单」卡片全量可见（内置 / env / 面板黑名单、白名单、动态学习名单分来源展示），面板黑名单与白名单可增删（持久化到数据库，重启不丢；白名单优先级最高，可解除内置/env 拦截）。`/api/appid-deny` 升级为完整策略视图 + `action=add_deny|remove_deny|add_allow|remove_allow|clear_learned`（管理员），响应从 `{denied}` 改为 `{builtin,env_denied,persisted_deny,allow,learned,...}`（脚本若解析旧字段需适配）。env 名单保持只读展示——要迁移到面板名单需在面板重新添加。
+
+## v0.2.82 - 2026-11-06
+
+- **Refresh PSK 持久化与实验室恢复探测（雷电/通用保活研究，protocolaudit）：** 手动授权握手除 access PSK（type 1）外还签发 refresh PSK（type 2），原生客户端持久化并在 access 被拒时用恢复握手，Go 历史上只在会话 blob 里存 access、refresh 直接丢弃——这正是 PR #144 雷电实验定位的传输恢复缺口。现在 WmpfSession 携带 RefreshPSK（blob 新增 refresh_psk_entry/has_refresh_psk，旧会话无此字段自动视为缺席），protocol-lab 新增 `--refresh-psk`：用 refresh PSK 走一次 0-RTT 业务探测，直接回答"网关是否接受 refresh 恢复、业务是否还能出码"。生产零行为变更（生产调度仍只用 access PSK）。
+- **ManualAuth 字段 6 实验开关：** PR #144 确认官方 ThirdApp 序列化器显式写空 bytes 字段 6 而 Go 省略。`buildManualAuthRequest` 支持 field6 变体（protocol-lab `--manualauth-field6`，仅对新鲜票据运行生效），生产布局不变。
+- **渠道 2 链路定论（docs/channel-pipeline-20261105.md）：** flue.dll 的 session_id 全是渲染会话；RadiumWMPF 的 ilink2.dll 含 `ilinkapp_getloginqrcode/checkloginqrcode/getoauthcode`——运行时自身的微信登录走 ilink 层、session_id 是 ilink 登录产物。渠道 2 是两层扫码叠加（运行时 ilink 登录 + 每应用 wxaruntime 授权），Go 复刻先从 ilink getloginqrcode/checkloginqrcode 两路由开始。
+
+## v0.2.82 - 2026-11-06
+
+- **Refresh PSK 持久化与实验室恢复探测（雷电/通用保活研究，protocolaudit）：** 手动授权握手除 access PSK（type 1）外还签发 refresh PSK（type 2），原生客户端持久化并在 access 被拒时用恢复握手，Go 历史上只在会话 blob 里存 access、refresh 直接丢弃——这正是 PR #144 雷电实验定位的传输恢复缺口。现在 WmpfSession 携带 RefreshPSK（blob 新增 refresh_psk_entry/has_refresh_psk，旧会话无此字段自动视为缺席），protocol-lab 新增 `--refresh-psk`：用 refresh PSK 走一次 0-RTT 业务探测，直接回答"网关是否接受 refresh 恢复、业务是否还能出码"。生产零行为变更（生产调度仍只用 access PSK）。
+- **ManualAuth 字段 6 实验开关：** PR #144 确认官方 ThirdApp 序列化器显式写空 bytes 字段 6 而 Go 省略。`buildManualAuthRequest` 支持 field6 变体（protocol-lab `--manualauth-field6`，仅对新鲜票据运行生效），生产布局不变。
+- **渠道 2 链路定论（docs/channel-pipeline-20261105.md）：** flue.dll 的 session_id 全是渲染会话；RadiumWMPF 的 ilink2.dll 含 `ilinkapp_getloginqrcode/checkloginqrcode/getoauthcode`——运行时自身的微信登录走 ilink 层、session_id 是 ilink 登录产物。渠道 2 是两层扫码叠加（运行时 ilink 登录 + 每应用 wxaruntime 授权），Go 复刻先从 ilink getloginqrcode/checkloginqrcode 两路由开始。
+
+## v0.2.81 - 2026-11-06
+
+- **新增 QQ 浏览器渠道 qbbrowser（伴生扩展模式，链路全通）：** 与前三条"扫码换票据"不同，QQ 浏览器的授权载体是浏览器自身的微信登录态（WUP trpc.mtt.wx_auth.wx_auth/WXAuth 换外层 token，续期走 qbtoken/RefreshToken）。token→票据的网关已定位：POST kde.qq.com/trpc.ad.wx_oauth_svr.WxOauthHttpSvr/GetWxLoginBuffer，请求 {access_token, user_id, appid: wx0dbc1ae97f156c38, guid} 返回 {login_buffer, err_code}（假 token 实测回 err_code=10002）。token 在浏览器进程内（chrome.account/browser.login 桥），headless 服务拿不到——因此配套伴生扩展（extensions/qbbrowser-token/，加载进 QQ 浏览器即可）：桥自动尝试（browser.login.getAccountInfo → chrome.account.getLoginInfo）、每 30 分钟/启动时把 token POST 到 POST /api/qbbrowser/token（协议令牌门内），服务端现场换 buffer 验真（protobuf field3 == wx0dbc1ae97f156c38）并自动建号（OpenID qbbrowser:<uid>）。账号与其它渠道一样可进编队、走 /wx/code。QQ 浏览器本体无 ilink/WMPF 栈（chrome.dll 281MB 全量 0 命中），票据消费仍由我们的 Go ilink 栈完成——渠道身份是新增的第四个 host。
+
+## v0.2.80 - 2026-11-05
+
+- **多渠道扫码/链接页二维码尺寸统一：** 多渠道卡片里的二维码（220px）与单渠道（280px）、一次性链接页（260px）大小不一致导致观感不协调；统一为 280px 并升级静态资源缓存版本（v=051）。
+- **新渠道调研收敛（docs/channel-pipeline-20261105.md）：** QQ 浏览器 22.3.7007.400 实测定论——全量无 ilink/mmtls/WMPF 痕迹，其微信登录是浏览器账号同步用的 WUP OAuth（`trpc.mtt.wx_auth.wx_auth/WXAuth`：code+appid 换 openid/access_token/refresh_token/unionid/encrypted_refresh_token，续期走 qbtoken/RefreshToken），**不能作为取码渠道**；渠道 2（WMPF/UniWeChatWin）身份三元组与专用扫码端点族（`open.weixin.qq.com/wxaruntime/Getuuid|Getqrcode|qrconnect`，需 session_id）已映射，且有公开对照实现（ZHwin/yyb 的 wmpf.py，Windows-Ocean/CmdID 4963）；渠道 5 确认官方样本即 RadiumWMPF 2.4.4.49（dldir1.qq.com 直链 MD5 已验），**ThirdAppLogin/AutoLogin 参数官方头文件已随包给出**，登录 buffer 官方来源为 `sns/pcsdk/login`（scope `snsapi_runtime_pcsdk`）。渠道 2/5 的协议实现需要新一轮扫码/实验验证，在本调研文档继续跟踪。
 
 ## v0.2.78 - 2026-11-05
 

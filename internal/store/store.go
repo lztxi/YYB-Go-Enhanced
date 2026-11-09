@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"yyb_go/internal/qbbrowser"
+
 	_ "modernc.org/sqlite"
 )
+
+var ErrQQBrowserBridgeDowngrade = errors.New("QQBrowser standalone authorization cannot be replaced by a browser token push")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS wechat_accounts (
@@ -107,6 +112,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS account_circuit_settings (
+    account_id INTEGER PRIMARY KEY REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+);
+
 CREATE TABLE IF NOT EXISTS account_links (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     token_hash      TEXT    NOT NULL UNIQUE,
@@ -117,12 +127,20 @@ CREATE TABLE IF NOT EXISTS account_links (
     token_ciphertext TEXT   NOT NULL DEFAULT '',
     target_product TEXT    NOT NULL DEFAULT '',
     switch_confirmed INTEGER NOT NULL DEFAULT 0,
+    allow_multi_channel INTEGER NOT NULL DEFAULT 0,
+    multi_primary_id INTEGER REFERENCES wechat_accounts(id) ON DELETE CASCADE,
     expires_at      INTEGER NOT NULL,
     used_at         INTEGER,
     revoked_at      INTEGER,
     created_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_account_links_expires ON account_links(expires_at);
+CREATE TABLE IF NOT EXISTS account_link_scans (
+    link_id INTEGER NOT NULL REFERENCES account_links(id) ON DELETE CASCADE,
+    product TEXT NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    PRIMARY KEY(link_id, product)
+);
 `
 
 var defaultFeatures = []Feature{
@@ -254,6 +272,8 @@ func migrateAccountLinks(ctx context.Context, db *sql.DB) error {
 		{"revoked_at", "INTEGER"},
 		{"target_product", "TEXT NOT NULL DEFAULT ''"},
 		{"switch_confirmed", "INTEGER NOT NULL DEFAULT 0"},
+		{"allow_multi_channel", "INTEGER NOT NULL DEFAULT 0"},
+		{"multi_primary_id", "INTEGER REFERENCES wechat_accounts(id) ON DELETE CASCADE"},
 	} {
 		exists, err := sqliteColumnExists(ctx, db, "account_links", column.name)
 		if err != nil {
@@ -463,8 +483,22 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	// Reuse the lowest free account slot. This keeps a single account at ID 1
 	// after it is deleted and scanned again, while preserving existing IDs.
 	var existingID int64
-	err = tx.QueryRowContext(ctx, "SELECT id FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID)
+	var previousCredentials sql.NullString
+	err = tx.QueryRowContext(ctx, "SELECT id,credentials FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID, &previousCredentials)
 	if err == nil {
+		if credentials["provider"] == "qbbrowser" {
+			var previous, incoming struct {
+				Provider string                `json:"provider"`
+				QQ       qbbrowser.Credentials `json:"qbbrowser"`
+			}
+			_ = json.Unmarshal([]byte(previousCredentials.String), &previous)
+			_ = json.Unmarshal([]byte(credJSON.String), &incoming)
+			// An extension left running must not erase the standalone refresh
+			// chain. Check inside the write transaction to cover concurrent scans.
+			if previous.Provider == "qbbrowser" && previous.QQ.CanRefresh() && !incoming.QQ.CanRefresh() {
+				return nil, ErrQQBrowserBridgeDowngrade
+			}
+		}
 		_, err = tx.ExecContext(ctx,
 			`UPDATE wechat_accounts SET login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?, credentials=?, status=?, updated_at=? WHERE id=?`,
 			loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
@@ -729,7 +763,10 @@ func (db *DB) CompactAccountIDs(ctx context.Context) (map[int64]int64, error) {
 		{"account_script_jobs", "account_id"},
 		{"account_push_settings", "account_id"},
 		{"account_proxy_settings", "account_id"},
+		{"account_circuit_settings", "account_id"},
 		{"account_links", "account_id"},
+		{"account_links", "multi_primary_id"},
+		{"account_link_scans", "account_id"},
 	}
 	for oldID := range mapping {
 		// Fleets point at their primary by ID, so the pointer moves with it.
@@ -896,8 +933,7 @@ WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`
 func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	now := time.Now().Unix()
 	if status == "expired" {
-		// Expiry wipes the credentials but keeps the channel marker, which for a
-		// GameAssist account is the only thing that says what it is.
+		// Expiry wipes secrets but keeps the non-secret channel identity.
 		var raw sql.NullString
 		if err := db.sql.QueryRowContext(ctx, "SELECT credentials FROM wechat_accounts WHERE id=?", id).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1114,18 +1150,27 @@ func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, erro
 	return &f, nil
 }
 
-func (a *WechatAccount) Public() AccountPublic {
-	product := "appstore"
-	switch {
-	case strings.HasPrefix(a.OpenID, "pcmgr:"):
-		product = "pcmgr"
-	case stringCredential(a.Credentials, "provider") == "pcmgr":
-		product = "pcmgr"
-	case stringCredential(a.Credentials, "provider") == "gameassist":
-		// GameAssist accounts keep their real WeChat openId, so the provider
-		// marker is the only channel signal.
-		product = "gameassist"
+// ScanProduct identifies the channel even for historical records whose secrets
+// and provider marker were wiped. Only explicit identity namespaces can recover
+// a missing marker; native OpenIDs alone cannot distinguish GameAssist from YYB.
+func (a *WechatAccount) ScanProduct() string {
+	if a == nil {
+		return "appstore"
 	}
+	for _, provider := range []string{"pcmgr", "qbbrowser", "ldplayer"} {
+		if strings.HasPrefix(a.OpenID, provider+":") {
+			return provider
+		}
+	}
+	switch provider := stringCredential(a.Credentials, "provider"); provider {
+	case "pcmgr", "gameassist", "qbbrowser", "ldplayer":
+		return provider
+	}
+	return "appstore"
+}
+
+func (a *WechatAccount) Public() AccountPublic {
+	product := a.ScanProduct()
 	var refreshTokenObservedAt *int64
 	rescanRecommended := a.SessionOnly()
 	var credentialExpiresAt *int64
@@ -1145,6 +1190,27 @@ func (a *WechatAccount) Public() AccountPublic {
 		if refreshedAt := int64Credential(a.Credentials, "refresh_refreshed_at"); refreshedAt > 0 {
 			credentialExpiresAtValue = refreshedAt + credentialExpiresIn
 		}
+	}
+	if product == "gameassist" && stringCredential(a.Credentials, "expiry_source") == "" && credentialExpiresIn == 30*86400 && credentialExpiresAtValue > 0 {
+		credentialExpiresAtValue = credentialExpiresAtValue - credentialExpiresIn + 7200
+		credentialExpiresIn = 7200
+	}
+	if product == "qbbrowser" {
+		var qb qbbrowser.Credentials
+		raw, _ := json.Marshal(a.Credentials["qbbrowser"])
+		_ = json.Unmarshal(raw, &qb)
+		// Native WXAuth has an upstream expiry; historical ctk-only imports
+		// do not. Neither has a verified 30-day authorization lifetime.
+		credentialExpiresAtValue, credentialExpiresIn = int64Credential(a.Credentials, "expires_at"), int64Credential(a.Credentials, "expires_in")
+		if !qb.CanRefresh() {
+			credentialExpiresAtValue, credentialExpiresIn = 0, 0
+		}
+		refreshTokenObservedAt, rescanRecommended = nil, a.SessionOnly()
+	}
+	if product == "ldplayer" {
+		// Previous versions stored fabricated one/seven-day placeholders.
+		credentialExpiresAtValue, credentialExpiresIn = 0, 0
+		refreshTokenObservedAt = nil
 	}
 	if credentialExpiresAtValue > 0 {
 		expiresAt := credentialExpiresAtValue
@@ -1182,17 +1248,12 @@ func stringCredential(values map[string]any, key string) string {
 	return value
 }
 
-// keepChannelMarkers returns what survives when an account's credentials are
-// wiped because the authorization was rejected: the marker that says which
-// channel the account belongs to, and nothing secret. A GameAssist account keeps
-// its real WeChat openId, so its provider marker is the only thing telling it
-// apart from an App Store account; losing it relabelled the account as YYB in
-// the console, in the events and in the offline notice. PCMgr accounts are told
-// apart by their "pcmgr:" openId prefix and App Store accounts carry no marker,
-// so only GameAssist needs this.
+// keepChannelMarkers retains only a known, non-secret provider marker when a
+// rejected authorization is wiped. Channel identity must outlive its secrets.
 func keepChannelMarkers(credentials map[string]any) map[string]any {
-	if stringCredential(credentials, "provider") == "gameassist" {
-		return map[string]any{"provider": "gameassist"}
+	switch provider := stringCredential(credentials, "provider"); provider {
+	case "pcmgr", "gameassist", "qbbrowser", "ldplayer":
+		return map[string]any{"provider": provider}
 	}
 	return nil
 }
@@ -1276,8 +1337,16 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	if uin.Valid {
 		s.UIN = &uin.Int64
 	}
-	if err := json.Unmarshal([]byte(blob), &s.SessionBlob); err != nil {
+	// Session identities are int64, often beyond float64's exact integer
+	// range. A rounded UIN makes every request after the fresh login carry a
+	// different identity. Keep the JSON number until protocol conversion.
+	decoder := json.NewDecoder(strings.NewReader(blob))
+	decoder.UseNumber()
+	if err := decoder.Decode(&s.SessionBlob); err != nil {
 		return nil, fmt.Errorf("decode session_blob: %w", err)
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return nil, fmt.Errorf("decode session_blob: trailing data")
 	}
 	s.blobJSON = blob
 	return &s, nil

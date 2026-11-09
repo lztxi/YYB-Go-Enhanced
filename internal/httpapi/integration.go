@@ -74,6 +74,10 @@ func (a *App) handleIntegrationAccounts(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	accounts, ok := accountListForRequest(w, r, accounts)
+	if !ok {
+		return
+	}
 	out := make([]map[string]any, 0, len(accounts))
 	for _, account := range accounts {
 		public := account.Public()
@@ -170,12 +174,12 @@ func (a *App) handleIntegrationGetCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := a.invokeWXApp(withWXOperationContext(r.Context(), eventlog.OpGetCode), account, strings.TrimSpace(body.AppID), nil, a.invokeGetCode)
+	result, err := a.invokeWithFleet(withWXOperationContext(r.Context(), eventlog.OpGetCode), account, strings.TrimSpace(body.AppID), nil, a.invokeGetCode)
 	if err != nil {
 		if writeIfCircuitOpen(w, err) || writeIfAppIDDenied(w, err) {
 			return
 		}
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeProtocolCallError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"account_id": account.ID, "result": result})
