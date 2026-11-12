@@ -23,6 +23,7 @@ import (
 
 	"yyb_go/internal/auth"
 	"yyb_go/internal/eventlog"
+	"yyb_go/internal/oauth"
 	"yyb_go/internal/pcmgr"
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/proxysource"
@@ -932,20 +933,22 @@ func (a *App) handleH5CodeAlias(w http.ResponseWriter, r *http.Request) {
 	a.callWXApp(w, withWXOperation(r, eventlog.OpH5Code), false, a.invokeH5Code)
 }
 
-// learnDeniedAppID counts a code request that reached the upstream and came
-// back without a code. The AppID is denied once the outcome repeats on the
-// configured number of distinct accounts, because one bursted account can stop
-// receiving codes on every AppID at once (docs/h5-oauth-code.md). Denials
-// persist across restarts and YYB_CODE_ALLOW_APPIDS still overrides them.
+// Empty codes can be account-wide failures. Count distinct primary groups,
+// never several channel identities of one WeChat as independent evidence.
+// Learning only creates a temporary hold; an explicit allowance always wins.
 func (a *App) learnDeniedAppID(acc *store.WechatAccount, appID string, callErr error) {
-	if !errors.Is(callErr, protocol.ErrLoginCodeUnavailable) {
+	if !errors.Is(callErr, protocol.ErrLoginCodeUnavailable) || a.appIDs.isAllowed(appID) {
 		return
 	}
-	denied := a.dynamicAppIDs.recordStrike(appID, acc.ID)
+	groupID := acc.ID
+	if primary := fleetPrimaryOf(acc); primary > 0 {
+		groupID = primary
+	}
+	denied := a.dynamicAppIDs.recordStrike(appID, groupID)
 	if !denied {
 		return
 	}
-	log.Printf("protocol: app id=%s denied for every account after repeated code requests returned no code (account id=%d); set YYB_CODE_ALLOW_APPIDS to override", appID, acc.ID)
+	log.Printf("protocol: app id=%s temporarily deferred after repeated empty codes (account id=%d); next normal request may recheck after cooldown", appID, acc.ID)
 	a.events.Emit("protocol.appid_dynamic_denied", eventlog.ForAccount(acc).WithTarget(appID, eventlog.OpGetCode, ""))
 }
 
@@ -1463,6 +1466,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		fields := eventlog.ForAccount(acc).WithTarget(appID, op, wxAPIName(op, payload))
 		fields.DurationMS = time.Since(started).Milliseconds()
 		fields.Rejections = eventRejections(errOut)
+		fields.ResponseStage = responseFailureStage(errOut)
 		event := "protocol.succeeded"
 		var open *circuitOpenError
 		var denied *appIDDeniedError
@@ -1484,14 +1488,11 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	}()
 	// A website-application AppID never gets a code and costs the account its
 	// authorization, so it is refused before anything else looks at the request.
-	// The H5 OAuth route honours the same list: its confirmations are one-time
-	// and a wrong appid family has no business there either.
+	// Explicit administrator/builtin denials apply to both routes. A learned
+	// wx.login failure only applies to mini-program login, not H5 OAuth.
 	if op == eventlog.OpGetCode || op == eventlog.OpH5Code {
 		if denied := a.appIDs.check(appID); denied != nil {
 			return nil, denied
-		}
-		if why, learned := a.dynamicAppIDs.check(appID); learned {
-			return nil, &appIDDeniedError{AppID: appID, Why: why}
 		}
 	}
 	// Bound queueing, protocol login and any credential recovery together.
@@ -1502,6 +1503,15 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	}
 	if accountNeedsRescan(acc) {
 		return nil, accountExpiredError{accountID: acc.ID, openid: acc.OpenID}
+	}
+	if op == eventlog.OpGetCode && !a.appIDs.isAllowed(appID) {
+		finish, denied := a.dynamicAppIDs.begin(appID)
+		if denied != nil {
+			return nil, denied
+		}
+		// Local gating, transport errors and typed business/credential errors
+		// do not extend an AppID hold. Only another empty-code outcome does.
+		defer func() { finish(errors.Is(errOut, protocol.ErrLoginCodeUnavailable)) }()
 	}
 	circuitEnabled, err := a.accountCircuitEnabled(ctx, acc.ID)
 	if err != nil {
@@ -1525,8 +1535,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	result, callErr := call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
 	a.recordCircuitOutcome(ctx, acc, appID, op, callErr)
 	if callErr == nil {
-		// A code that arrived proves the AppID is not one of the dangerous
-		// website applications; forget any earlier hiccup.
+		// This mini-program request succeeded; forget earlier empty outcomes.
 		if op == eventlog.OpGetCode {
 			a.dynamicAppIDs.recordSuccess(appID)
 		}
@@ -1729,20 +1738,18 @@ func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID
 }
 
 func (a *App) invokeH5Code(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
-	redirectURI, scope, state := h5CodeParams(payload)
-	if redirectURI == "" {
+	request := h5CodeParams(payload)
+	request.AppID = appID
+	if request.RedirectURI == "" {
 		return nil, fmt.Errorf("h5 code requires redirect_uri (and optional scope, state) inside payload")
 	}
-	return a.pool.GetH5Code(ctx, acc.LoginBuffer, appID, redirectURI, scope, state, acc.ID, proxyValue, fallbackDirect, acc)
+	return a.pool.GetH5Code(ctx, acc.LoginBuffer, request, acc.ID, proxyValue, fallbackDirect, acc)
 }
 
 // h5CodeParams reads the official-account OAuth parameters scripts send in the
 // payload. Empty scope defaults to snsapi_base and an empty state is generated
 // inside the protocol layer.
-func h5CodeParams(payload map[string]any) (string, string, string) {
-	if payload == nil {
-		return "", "", ""
-	}
+func h5CodeParams(payload map[string]any) oauth.Request {
 	field := func(keys ...string) string {
 		for _, key := range keys {
 			if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
@@ -1751,7 +1758,10 @@ func h5CodeParams(payload map[string]any) (string, string, string) {
 		}
 		return ""
 	}
-	return field("redirect_uri", "redirect"), field("scope"), field("state")
+	return oauth.Request{
+		RedirectURI: field("redirect_uri", "redirect"), Scope: field("scope"),
+		State: field("state"), ComponentAppID: field("component_appid"),
+	}
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
